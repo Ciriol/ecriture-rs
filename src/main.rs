@@ -1,14 +1,16 @@
 //! UI egui : canvas d'écriture + bouton de reconnaissance.
 
 mod ink;
+mod model;
 mod recognizer;
 mod tablet;
 
+use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver};
 
 use eframe::egui;
 use ink::{Point, Stroke};
-use recognizer::{CandleRecognizer, MockRecognizer, Norm, Recognizer};
+use recognizer::{CrnnRecognizer, MockRecognizer, Norm, Recognizer};
 use tablet::TabletEvent;
 
 /// Délai de pause (en secondes) après lequel on reconnaît les nouveaux strokes.
@@ -324,9 +326,12 @@ fn draw_stroke(painter: &egui::Painter, stroke: &Stroke, rect: egui::Rect) {
 
 /// Configuration (args CLI).
 struct Config {
-    model: String,
-    chars: String,
-    input_h: u32,
+    /// Checkpoint .pth local ; vocab.json et config.json attendus à côté.
+    pth: Option<String>,
+    /// Dépôt Hugging Face téléchargé si --pth absent (modèle par défaut).
+    repo: String,
+    /// Hauteur d'entrée du modèle (défaut: image_height du config.json).
+    input_h: Option<u32>,
     norm: Norm,
     /// Périphérique tablette forcé (ex. /dev/input/event9).
     tablet_device: Option<String>,
@@ -334,9 +339,10 @@ struct Config {
 
 fn usage_exit() -> ! {
     eprintln!(
-        "usage: ecriture-rs [--model PATH] [--chars PATH] [--input-h N] [--norm 01|neg1]\n\
+        "usage: ecriture-rs [--pth model.pth] [--repo owner/name] [--input-h N] [--norm 01|neg1]\n\
          \x20         [--tablet-device /dev/input/eventN]\n\
-         défauts: --model model.onnx --chars chars.txt --input-h 64 --norm 01,\n\
+         défauts: --repo Sachin-0001/crnn-iam-handwriting (téléchargé via Hugging Face),\n\
+         \x20         --input-h depuis config.json, --norm neg1,\n\
          \x20         tablette: auto-détection (ou ECRITURE_TABLET_DEVICE)"
     );
     std::process::exit(2)
@@ -344,22 +350,23 @@ fn usage_exit() -> ! {
 
 fn parse_args() -> Config {
     let mut cfg = Config {
-        model: "model.onnx".to_string(),
-        chars: "chars.txt".to_string(),
-        input_h: 64,
-        norm: Norm::ZeroOne,
+        pth: None,
+        repo: "Sachin-0001/crnn-iam-handwriting".to_string(),
+        input_h: None,
+        norm: Norm::NegOneOne,
         tablet_device: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--model" => cfg.model = args.next().unwrap_or_else(|| usage_exit()),
-            "--chars" => cfg.chars = args.next().unwrap_or_else(|| usage_exit()),
+            "--pth" => cfg.pth = Some(args.next().unwrap_or_else(|| usage_exit())),
+            "--repo" => cfg.repo = args.next().unwrap_or_else(|| usage_exit()),
             "--input-h" => {
-                cfg.input_h = args
-                    .next()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or_else(|| usage_exit())
+                cfg.input_h = Some(
+                    args.next()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or_else(|| usage_exit()),
+                )
             }
             "--norm" => {
                 cfg.norm = match args.next().as_deref() {
@@ -383,24 +390,71 @@ fn parse_args() -> Config {
 
 fn main() -> eframe::Result<()> {
     let cfg = parse_args();
+
+    // Résout les fichiers du modèle : locaux (--pth + vocab.json/config.json
+    // à côté) ou téléchargés depuis le dépôt HF (--repo).
+    let (pth, vocab_json, config_json) = match &cfg.pth {
+        Some(p) => {
+            let p = PathBuf::from(p);
+            let dir = p.parent().map(|d| d.to_path_buf()).unwrap_or_default();
+            (p, dir.join("vocab.json"), dir.join("config.json"))
+        }
+        None => match model::download_model_files(&cfg.repo) {
+            Ok(paths) => paths,
+            Err(e) => {
+                eprintln!("téléchargement HF impossible ({e:#}) : MockRecognizer");
+                (
+                    PathBuf::from("/nonexistent/model.pth"),
+                    PathBuf::from("/nonexistent/vocab.json"),
+                    PathBuf::from("/nonexistent/config.json"),
+                )
+            }
+        },
+    };
+    let mconfig: model::ModelConfig = match std::fs::read_to_string(&config_json) {
+        Ok(c) => serde_json::from_str(&c).unwrap_or(model::ModelConfig {
+            num_classes: 80,
+            hidden_size: 256,
+            image_height: 32,
+        }),
+        Err(_) => model::ModelConfig {
+            num_classes: 80,
+            hidden_size: 256,
+            image_height: 32,
+        },
+    };
+    let input_h = cfg.input_h.unwrap_or(mconfig.image_height);
     eprintln!(
-        "config: model={} chars={} input_h={} norm={:?} tablet_device={:?}",
-        cfg.model, cfg.chars, cfg.input_h, cfg.norm, cfg.tablet_device
+        "config: pth={} repo={} input_h={} norm={:?} tablet_device={:?}",
+        pth.display(),
+        cfg.repo,
+        input_h,
+        cfg.norm,
+        cfg.tablet_device
     );
+
     let options = eframe::NativeOptions::default();
     eframe::run_native(
         "ecriture-rs",
         options,
         Box::new(|_cc| {
+            let device = candle_core::Device::Cpu;
             // Modèle réel si présent, sinon bouchon pour tester l'UI.
-            let recognizer: Box<dyn Recognizer> =
-                match CandleRecognizer::new(&cfg.model, &cfg.chars, cfg.input_h, cfg.norm) {
-                    Ok(r) => Box::new(r),
-                    Err(e) => {
-                        eprintln!("{} illisible ({e:#}) : utilisation du MockRecognizer", cfg.model);
-                        Box::new(MockRecognizer)
-                    }
-                };
+            let recognizer: Box<dyn Recognizer> = match CrnnRecognizer::new(
+                &pth,
+                &vocab_json,
+                mconfig.num_classes,
+                mconfig.hidden_size,
+                input_h,
+                cfg.norm,
+                &device,
+            ) {
+                Ok(r) => Box::new(r),
+                Err(e) => {
+                    eprintln!("{} illisible ({e:#}) : utilisation du MockRecognizer", pth.display());
+                    Box::new(MockRecognizer)
+                }
+            };
             Ok(Box::new(InkApp::new(recognizer, cfg.tablet_device.clone())))
         }),
     )

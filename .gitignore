@@ -1,5 +1,1 @@
 /target
-/model.onnx
-__pycache__/
-.venv/
-tools/export-model/.hf/

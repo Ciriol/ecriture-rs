@@ -1,7 +1,7 @@
 # ecriture-rs
 
-Application Rust de prise de notes avec reconnaissance d'écriture quasi temps réel.
-Pipeline : capture de strokes (egui) → inférence ONNX locale (candle) → texte.
+Application Rust de prise de notes avec reconnaissance d'écriture quasi temps réel, 100 % Rust.
+Pipeline : capture de strokes (egui souris/touch, evdev pour le stylet) → inférence locale (candle, CRNN depuis un checkpoint .pth) → texte CTC.
 
 ## À faire
 
@@ -30,10 +30,10 @@ Ajouter des gestes de contrôle au-delà du simple tracé :
 - Pause longue sans tracé : séparateur implicite entre deux unités de texte.
 - Refléter espaces et retours à la ligne dans le panneau de résultat.
 
-### 4. Brancher un vrai modèle
-Le `MockRecognizer` sert à valider l'UI ; il reste à brancher le vrai modèle :
+### 4. Modèle réel (déjà branché en natif Rust)
+Le CRNN (CNN-BiLSTM-CTC) est chargé directement depuis un checkpoint PyTorch `.pth` : lecture pure Rust via `pthrs`, poids téléchargés depuis Hugging Face via `hf-hub`, inférence candle. Aucun Python ni ONNX.
 
-- Placer `model.onnx` et `chars.txt` (un caractère par ligne, dans l'ordre des classes du modèle) à la racine du projet.
-- Configurable en CLI : `cargo run --release -- --model model.onnx --chars chars.txt --input-h 64 --norm 01|neg1` (`--input-h` = hauteur d'entrée du modèle, `--norm 01` = pixels 0..1 blanc=1, `neg1` = -1..1).
-- Vérifier que `CandleRecognizer` charge le graphe (noms d'entrée/sortie lus depuis le proto ONNX) et que le décodage CTC produit du texte cohérent sur un échantillon connu.
-- Comparer les sorties modèle réel vs mock sur les mêmes strokes.
+- Par défaut : `cargo run --release` télécharge `Sachin-0001/crnn-iam-handwriting` (model.pth, vocab.json, config.json) — hauteur d'entrée 32, normalisation [-1, 1] prises depuis `config.json`.
+- Modèle local : `--pth /chemin/model.pth` (vocab.json et config.json attendus à côté).
+- Options CLI : `--repo owner/name`, `--input-h N`, `--norm 01|neg1`, `--tablet-device /dev/input/eventN`.
+- Reste à faire : comparer les sorties modèle réel vs `MockRecognizer` sur les mêmes strokes, et valider la qualité sur de l'écriture réelle.

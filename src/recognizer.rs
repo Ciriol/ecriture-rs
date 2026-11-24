@@ -1,18 +1,30 @@
-//! Inférence de reconnaissance d'écriture via ONNX (candle), 100 % locale.
+//! Inférence de reconnaissance d'écriture, 100 % locale et 100 % Rust :
+//! le CRNN est chargé depuis un checkpoint PyTorch .pth (voir model.rs).
+
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use candle_core::{Device, Tensor};
 use image::GrayImage;
 
-/// Alphabet du modèle. Le token CTC "blank" est l'index 0.
-/// Fichier chars.txt : un caractère par ligne, dans l'ordre du modèle.
-pub fn load_charset(path: &str) -> Result<Vec<char>> {
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("charset introuvable: {}", path))?;
-    let mut chars: Vec<char> = content.chars().filter(|c| *c != '\n').collect();
-    // On réserve l'index 0 pour le blank CTC.
-    chars.insert(0, '\u{0}');
-    Ok(chars)
+use crate::model::Crnn;
+
+/// Normalisation des pixels en entrée du modèle.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Norm {
+    /// 0..1, fond blanc = 1.0.
+    ZeroOne,
+    /// -1..1, encre noire = -1.0, fond blanc = 1.0.
+    NegOneOne,
+}
+
+impl Norm {
+    fn apply(self, v: f32) -> f32 {
+        match self {
+            Norm::ZeroOne => v,
+            Norm::NegOneOne => v * 2.0 - 1.0,
+        }
+    }
 }
 
 pub trait Recognizer {
@@ -44,64 +56,41 @@ pub fn ctc_greedy_decode(logits: &[f32], width: usize, height: usize, charset: &
     out
 }
 
-/// Normalisation des pixels en entrée du modèle.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Norm {
-    /// 0..1, fond blanc = 1.0 (défaut).
-    ZeroOne,
-    /// -1..1, encre noire = -1.0, fond blanc = 1.0.
-    NegOneOne,
-}
-
-impl Norm {
-    fn apply(self, v: f32) -> f32 {
-        match self {
-            Norm::ZeroOne => v,
-            Norm::NegOneOne => v * 2.0 - 1.0,
-        }
-    }
-}
-
-/// Reconnaissance via un modèle ONNX simple (CRNN / CNN-BiLSTM-CTC à graphe unique).
-/// Entrée : image grayscale normalisée [1, 1, H, W] en f32 (voir `Norm`).
-/// Sortie : logits [1, T, num_classes].
-pub struct CandleRecognizer {
-    model: candle_onnx::onnx::ModelProto,
-    input_name: String,
-    output_name: String,
+/// Reconnaissance via le CRNN chargé depuis un .pth (CNN-BiLSTM-CTC).
+/// Entrée : image grayscale redimensionnée à hauteur `input_h`, normalisée
+/// selon `norm`, tenseur [1, 1, H, W]. Sortie du modèle : logits [1, T, C].
+pub struct CrnnRecognizer {
+    model: Crnn,
     charset: Vec<char>,
     device: Device,
     input_h: u32,
     norm: Norm,
 }
 
-impl CandleRecognizer {
-    pub fn new(onnx_path: &str, charset_path: &str, input_h: u32, norm: Norm) -> Result<Self> {
-        let model = candle_onnx::read_file(onnx_path)
-            .with_context(|| format!("modèle ONNX introuvable: {}", onnx_path))?;
-        let graph = model
-            .graph
-            .as_ref()
-            .context("le fichier ONNX ne contient pas de graphe")?;
-        let input_name = graph
-            .input
-            .first()
-            .context("le graphe ONNX n'a pas d'entrée")?
-            .name
-            .clone();
-        let output_name = graph
-            .output
-            .first()
-            .context("le graphe ONNX n'a pas de sortie")?
-            .name
-            .clone();
-        let charset = load_charset(charset_path)?;
+impl CrnnRecognizer {
+    pub fn new(
+        pth_path: &Path,
+        vocab_path: &Path,
+        num_classes: usize,
+        hidden_size: usize,
+        input_h: u32,
+        norm: Norm,
+        device: &Device,
+    ) -> Result<Self> {
+        let model = Crnn::load(pth_path, num_classes, hidden_size, device)
+            .with_context(|| format!("chargement du modèle {}", pth_path.display()))?;
+        let charset = crate::model::load_charset(vocab_path)?;
+        if charset.len() != num_classes {
+            anyhow::bail!(
+                "vocab ({} classes) != num_classes du modèle ({})",
+                charset.len(),
+                num_classes
+            );
+        }
         Ok(Self {
             model,
-            input_name,
-            output_name,
             charset,
-            device: Device::Cpu,
+            device: device.clone(),
             input_h,
             norm,
         })
@@ -126,20 +115,13 @@ impl CandleRecognizer {
     }
 }
 
-impl Recognizer for CandleRecognizer {
+impl Recognizer for CrnnRecognizer {
     fn recognize(&mut self, img: &GrayImage) -> Result<String> {
         let input = self.image_to_tensor(img)?;
-        let mut inputs = std::collections::HashMap::new();
-        inputs.insert(self.input_name.clone(), input);
-        let outputs = candle_onnx::simple_eval(&self.model, inputs).context("inférence ONNX")?;
-        let logits = outputs
-            .get(&self.output_name)
-            .context("sortie du modèle introuvable")?
-            .to_device(&Device::Cpu)
-            .context("lecture des logits")?;
-        let shape = logits.dims();
-        // shape attendu : [1, T, C]
-        let (t, c) = (shape[1], shape[2]);
+        let logits = self.model.forward(&input).context("inférence CRNN")?;
+        // logits [1, T, C]
+        let dims = logits.dims();
+        let (t, c) = (dims[1], dims[2]);
         let flat = logits
             .flatten_all()
             .context("aplatissement des logits")?

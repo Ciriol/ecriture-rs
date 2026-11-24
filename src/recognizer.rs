@@ -44,8 +44,26 @@ pub fn ctc_greedy_decode(logits: &[f32], width: usize, height: usize, charset: &
     out
 }
 
+/// Normalisation des pixels en entrée du modèle.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Norm {
+    /// 0..1, fond blanc = 1.0 (défaut).
+    ZeroOne,
+    /// -1..1, encre noire = -1.0, fond blanc = 1.0.
+    NegOneOne,
+}
+
+impl Norm {
+    fn apply(self, v: f32) -> f32 {
+        match self {
+            Norm::ZeroOne => v,
+            Norm::NegOneOne => v * 2.0 - 1.0,
+        }
+    }
+}
+
 /// Reconnaissance via un modèle ONNX simple (CRNN / CNN-BiLSTM-CTC à graphe unique).
-/// Entrée : image grayscale normalisée [1, 1, H, W] en f32 (0..1, fond blanc = 1).
+/// Entrée : image grayscale normalisée [1, 1, H, W] en f32 (voir `Norm`).
 /// Sortie : logits [1, T, num_classes].
 pub struct CandleRecognizer {
     model: candle_onnx::onnx::ModelProto,
@@ -54,10 +72,11 @@ pub struct CandleRecognizer {
     charset: Vec<char>,
     device: Device,
     input_h: u32,
+    norm: Norm,
 }
 
 impl CandleRecognizer {
-    pub fn new(onnx_path: &str, charset_path: &str, input_h: u32) -> Result<Self> {
+    pub fn new(onnx_path: &str, charset_path: &str, input_h: u32, norm: Norm) -> Result<Self> {
         let model = candle_onnx::read_file(onnx_path)
             .with_context(|| format!("modèle ONNX introuvable: {}", onnx_path))?;
         let graph = model
@@ -84,6 +103,7 @@ impl CandleRecognizer {
             charset,
             device: Device::Cpu,
             input_h,
+            norm,
         })
     }
 
@@ -99,8 +119,7 @@ impl CandleRecognizer {
         );
         let mut data = vec![0f32; (w * self.input_h) as usize];
         for (i, p) in resized.pixels().enumerate() {
-            // 255 (blanc) -> 1.0, 0 (noir) -> 0.0
-            data[i] = p.0[0] as f32 / 255.0;
+            data[i] = self.norm.apply(p.0[0] as f32 / 255.0);
         }
         Tensor::from_vec(data, (1, 1, self.input_h as usize, w as usize), &self.device)
             .context("construction du tenseur d'entrée")

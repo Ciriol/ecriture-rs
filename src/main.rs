@@ -8,7 +8,7 @@ use std::sync::mpsc::{channel, Receiver};
 
 use eframe::egui;
 use ink::{Point, Stroke};
-use recognizer::{CandleRecognizer, MockRecognizer, Recognizer};
+use recognizer::{CandleRecognizer, MockRecognizer, Norm, Recognizer};
 use tablet::TabletEvent;
 
 /// Délai de pause (en secondes) après lequel on reconnaît les nouveaux strokes.
@@ -322,7 +322,63 @@ fn draw_stroke(painter: &egui::Painter, stroke: &Stroke, rect: egui::Rect) {
     ));
 }
 
+/// Configuration du modèle de reconnaissance (args CLI).
+struct Config {
+    model: String,
+    chars: String,
+    input_h: u32,
+    norm: Norm,
+}
+
+fn usage_exit() -> ! {
+    eprintln!(
+        "usage: ecriture-rs [--model PATH] [--chars PATH] [--input-h N] [--norm 01|neg1]\n\
+         défauts: --model model.onnx --chars chars.txt --input-h 64 --norm 01"
+    );
+    std::process::exit(2)
+}
+
+fn parse_args() -> Config {
+    let mut cfg = Config {
+        model: "model.onnx".to_string(),
+        chars: "chars.txt".to_string(),
+        input_h: 64,
+        norm: Norm::ZeroOne,
+    };
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--model" => cfg.model = args.next().unwrap_or_else(|| usage_exit()),
+            "--chars" => cfg.chars = args.next().unwrap_or_else(|| usage_exit()),
+            "--input-h" => {
+                cfg.input_h = args
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| usage_exit())
+            }
+            "--norm" => {
+                cfg.norm = match args.next().as_deref() {
+                    Some("neg1") => Norm::NegOneOne,
+                    Some("01") => Norm::ZeroOne,
+                    _ => usage_exit(),
+                }
+            }
+            "-h" | "--help" => usage_exit(),
+            other => {
+                eprintln!("argument inconnu: {other}");
+                usage_exit();
+            }
+        }
+    }
+    cfg
+}
+
 fn main() -> eframe::Result<()> {
+    let cfg = parse_args();
+    eprintln!(
+        "config: model={} chars={} input_h={} norm={:?}",
+        cfg.model, cfg.chars, cfg.input_h, cfg.norm
+    );
     let options = eframe::NativeOptions::default();
     eframe::run_native(
         "ecriture-rs",
@@ -330,10 +386,10 @@ fn main() -> eframe::Result<()> {
         Box::new(|_cc| {
             // Modèle réel si présent, sinon bouchon pour tester l'UI.
             let recognizer: Box<dyn Recognizer> =
-                match CandleRecognizer::new("model.onnx", "chars.txt", 64) {
+                match CandleRecognizer::new(&cfg.model, &cfg.chars, cfg.input_h, cfg.norm) {
                     Ok(r) => Box::new(r),
-                    Err(_) => {
-                        eprintln!("model.onnx absent : utilisation du MockRecognizer");
+                    Err(e) => {
+                        eprintln!("{} illisible ({e:#}) : utilisation du MockRecognizer", cfg.model);
                         Box::new(MockRecognizer)
                     }
                 };

@@ -34,5 +34,6 @@ Ajouter des gestes de contrôle au-delà du simple tracé :
 Le `MockRecognizer` sert à valider l'UI ; il reste à brancher le vrai modèle :
 
 - Placer `model.onnx` et `chars.txt` (un caractère par ligne, dans l'ordre des classes du modèle) à la racine du projet.
+- Configurable en CLI : `cargo run --release -- --model model.onnx --chars chars.txt --input-h 64 --norm 01|neg1` (`--input-h` = hauteur d'entrée du modèle, `--norm 01` = pixels 0..1 blanc=1, `neg1` = -1..1).
 - Vérifier que `CandleRecognizer` charge le graphe (noms d'entrée/sortie lus depuis le proto ONNX) et que le décodage CTC produit du texte cohérent sur un échantillon connu.
 - Comparer les sorties modèle réel vs mock sur les mêmes strokes.

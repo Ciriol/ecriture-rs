@@ -111,22 +111,10 @@ fn read_loop(path: String, tx: Sender<TabletEvent>) {
     let max_y = max_of(AbsoluteAxisCode::ABS_Y);
     let max_p = max_of(AbsoluteAxisCode::ABS_PRESSURE);
 
-    // Contact réel : BTN_TOUCH (pointe ou doigt au contact). BTN_TOOL_PEN
-    // passe à 1 dès la proximité (hover), avant le contact : on ne l'utilise
-    // que si le périphérique n'a pas BTN_TOUCH.
-    let contact_code = if dev
-        .supported_keys()
-        .map(|k| k.contains(KeyCode::BTN_TOUCH))
-        .unwrap_or(false)
-    {
-        KeyCode::BTN_TOUCH.0
-    } else {
-        KeyCode::BTN_TOOL_PEN.0
-    };
-
     let mut x = 0.0f32;
     let mut y = 0.0f32;
-    let mut pressure = 1.0f32;
+    let mut pressure = 0.0f32;
+    let mut btn_touch = false;
     let mut down = false;
     let mut just_started = false;
 
@@ -143,14 +131,10 @@ fn read_loop(path: String, tx: Sender<TabletEvent>) {
             let value = ev.value();
             match ev.event_type() {
                 EventType::KEY => {
-                    if code == contact_code {
-                        if value == 1 && !down {
-                            down = true;
-                            just_started = true;
-                        } else if value == 0 && down {
-                            down = false;
-                            let _ = tx.send(TabletEvent::Up);
-                        }
+                    // BTN_TOUCH = contact réel. BTN_TOOL_PEN = proximité (hover),
+                    // on ne s'en sert PAS pour le contact.
+                    if code == KeyCode::BTN_TOUCH.0 {
+                        btn_touch = value == 1;
                     }
                 }
                 EventType::ABSOLUTE => {
@@ -166,10 +150,20 @@ fn read_loop(path: String, tx: Sender<TabletEvent>) {
                         pressure = (value as f32 / max_p).clamp(0.0, 1.0);
                     }
                 }
-                // Fin d'un paquet d'événements atomique : on émet le point.
-                // Le Down est émis ici (et pas au BTN_TOUCH) pour que les
-                // coordonnées x/y soient à jour au moment du contact.
+                // Fin d'un paquet atomique : c'est ici qu'on décide du contact.
+                // Contact = BTN_TOUCH enfoncé OU pression > 0 (certains drivers
+                // n'émettent pas BTN_TOUCH ; la pression est fiable au contact
+                // et à 0 en hover). La fin du stroke = plus de contact, PAS la
+                // perte de proximité (BTN_TOOL_PEN).
                 EventType::SYNCHRONIZATION => {
+                    let contact = btn_touch || pressure > 0.0;
+                    if contact && !down {
+                        down = true;
+                        just_started = true;
+                    } else if !contact && down {
+                        down = false;
+                        let _ = tx.send(TabletEvent::Up);
+                    }
                     if down {
                         if just_started {
                             just_started = false;

@@ -294,6 +294,14 @@ impl eframe::App for InkApp {
                 self.debug_info
                     .push_str(&format!("\ntablet events: {}", self.tablet_count));
             }
+
+            // Tant qu'un stroke est ouvert, on force le repaint : avec le
+            // stylet lu en evdev, aucun événement winit n'arrive à egui,
+            // donc egui ne repeint pas tout seul et la trace n'apparaîtrait
+            // qu'à la fin du stroke.
+            if self.current.is_some() {
+                ui.ctx().request_repaint();
+            }
         });
 
         // Reconnaissance incrémentale : après une pause de tracé,

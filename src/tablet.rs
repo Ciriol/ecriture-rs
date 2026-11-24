@@ -114,45 +114,50 @@ fn read_loop(path: String, tx: Sender<TabletEvent>) {
     let mut pressure = 1.0f32;
     let mut down = false;
 
-    let stream = match dev.fetch_events() {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-    for ev in stream {
-        let code = ev.code();
-        let value = ev.value();
-        match ev.event_type() {
-            EventType::KEY => {
-                if code == KeyCode::BTN_TOUCH.0 || code == KeyCode::BTN_TOOL_PEN.0 {
-                    if value == 1 && !down {
-                        down = true;
-                        let _ = tx.send(TabletEvent::Down { x, y, pressure });
-                    } else if value == 0 && down {
-                        down = false;
-                        let _ = tx.send(TabletEvent::Up);
+    // fetch_events() fait un read() bloquant (fd en mode bloquant) puis
+    // retourne les événements d'un batch ; il faut le rappeler en boucle,
+    // sinon l'itérateur s'arrête au premier SYN_REPORT.
+    loop {
+        let batch = match dev.fetch_events() {
+            Ok(b) => b,
+            Err(_) => break, // périphérique débranché ou erreur de lecture
+        };
+        for ev in batch {
+            let code = ev.code();
+            let value = ev.value();
+            match ev.event_type() {
+                EventType::KEY => {
+                    if code == KeyCode::BTN_TOUCH.0 || code == KeyCode::BTN_TOOL_PEN.0 {
+                        if value == 1 && !down {
+                            down = true;
+                            let _ = tx.send(TabletEvent::Down { x, y, pressure });
+                        } else if value == 0 && down {
+                            down = false;
+                            let _ = tx.send(TabletEvent::Up);
+                        }
                     }
                 }
-            }
-            EventType::ABSOLUTE => {
-                if code == AbsoluteAxisCode::ABS_X.0
-                    || code == AbsoluteAxisCode::ABS_MT_POSITION_X.0
-                {
-                    x = value as f32 / max_x;
-                } else if code == AbsoluteAxisCode::ABS_Y.0
-                    || code == AbsoluteAxisCode::ABS_MT_POSITION_Y.0
-                {
-                    y = value as f32 / max_y;
-                } else if code == AbsoluteAxisCode::ABS_PRESSURE.0 {
-                    pressure = (value as f32 / max_p).clamp(0.0, 1.0);
+                EventType::ABSOLUTE => {
+                    if code == AbsoluteAxisCode::ABS_X.0
+                        || code == AbsoluteAxisCode::ABS_MT_POSITION_X.0
+                    {
+                        x = value as f32 / max_x;
+                    } else if code == AbsoluteAxisCode::ABS_Y.0
+                        || code == AbsoluteAxisCode::ABS_MT_POSITION_Y.0
+                    {
+                        y = value as f32 / max_y;
+                    } else if code == AbsoluteAxisCode::ABS_PRESSURE.0 {
+                        pressure = (value as f32 / max_p).clamp(0.0, 1.0);
+                    }
                 }
-            }
-            // Fin d'un paquet d'événements atomique : on émet le point.
-            EventType::SYNCHRONIZATION => {
-                if down {
-                    let _ = tx.send(TabletEvent::Move { x, y, pressure });
+                // Fin d'un paquet d'événements atomique : on émet le point.
+                EventType::SYNCHRONIZATION => {
+                    if down {
+                        let _ = tx.send(TabletEvent::Move { x, y, pressure });
+                    }
                 }
+                _ => {}
             }
-            _ => {}
         }
     }
     eprintln!("tablette: fin de lecture de {}", path);

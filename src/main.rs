@@ -39,10 +39,11 @@ struct InkApp {
 }
 
 impl InkApp {
-    fn new(recognizer: Box<dyn Recognizer>, tablet_device: Option<String>) -> Self {
+    fn new(recognizer: Box<dyn Recognizer>, tablet_device: Option<String>, ctx: egui::Context) -> Self {
         // Lance la lecture evdev des périphériques stylet/touch en arrière-plan.
+        // Le thread evdev réveille egui (request_repaint) à chaque événement.
         let (tx, rx) = channel();
-        tablet::spawn_readers(tx, tablet_device);
+        tablet::spawn_readers(tx, tablet_device, ctx);
         Self {
             strokes: Vec::new(),
             current: None,
@@ -445,7 +446,7 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "ecriture-rs",
         options,
-        Box::new(|_cc| {
+        Box::new(|cc| {
             let device = candle_core::Device::Cpu;
             // Modèle réel si présent, sinon bouchon pour tester l'UI.
             let recognizer: Box<dyn Recognizer> = match CrnnRecognizer::new(
@@ -463,7 +464,11 @@ fn main() -> eframe::Result<()> {
                     Box::new(MockRecognizer)
                 }
             };
-            Ok(Box::new(InkApp::new(recognizer, cfg.tablet_device.clone())))
+            Ok(Box::new(InkApp::new(
+                recognizer,
+                cfg.tablet_device.clone(),
+                cc.egui_ctx.clone(),
+            )))
         }),
     )
 }

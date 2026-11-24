@@ -24,7 +24,9 @@ pub enum TabletEvent {
 /// Lance un thread de lecture pour chaque périphérique tablette/stylet trouvé.
 /// `device` force un périphérique précis ; sinon variable d'env
 /// ECRITURE_TABLET_DEVICE ; sinon auto-détection sur /dev/input/event*.
-pub fn spawn_readers(tx: Sender<TabletEvent>, device: Option<String>) {
+/// `ctx` sert à réveiller egui à chaque événement (sinon egui ne repeint pas,
+/// aucun événement winit n'étant émis par le stylet).
+pub fn spawn_readers(tx: Sender<TabletEvent>, device: Option<String>, ctx: egui::Context) {
     let paths = match device.or_else(|| std::env::var("ECRITURE_TABLET_DEVICE").ok()) {
         Some(p) => vec![p],
         None => list_event_devices(),
@@ -36,8 +38,9 @@ pub fn spawn_readers(tx: Sender<TabletEvent>, device: Option<String>) {
                 let name = dev.name().unwrap_or("?").to_string();
                 eprintln!("tablette: lecture de {} ({})", path, name);
                 let tx = tx.clone();
+                let ctx = ctx.clone();
                 let path = path.clone();
-                thread::spawn(move || read_loop(path, tx));
+                thread::spawn(move || read_loop(path, tx, ctx));
                 spawned += 1;
             }
             Ok(_) => {}
@@ -86,7 +89,14 @@ fn is_tablet(dev: &Device) -> bool {
     has_pen || (has_abs_xy && has_touch)
 }
 
-fn read_loop(path: String, tx: Sender<TabletEvent>) {
+/// Envoie un événement dans le channel ET réveille egui (request_repaint
+/// est appelable depuis un autre thread).
+fn send_event(tx: &Sender<TabletEvent>, ctx: &egui::Context, ev: TabletEvent) {
+    let _ = tx.send(ev);
+    ctx.request_repaint();
+}
+
+fn read_loop(path: String, tx: Sender<TabletEvent>, ctx: egui::Context) {
     let mut dev = match Device::open(&path) {
         Ok(d) => d,
         Err(_) => return,
@@ -162,14 +172,14 @@ fn read_loop(path: String, tx: Sender<TabletEvent>) {
                         just_started = true;
                     } else if !contact && down {
                         down = false;
-                        let _ = tx.send(TabletEvent::Up);
+                        send_event(&tx, &ctx, TabletEvent::Up);
                     }
                     if down {
                         if just_started {
                             just_started = false;
-                            let _ = tx.send(TabletEvent::Down { x, y, pressure });
+                            send_event(&tx, &ctx, TabletEvent::Down { x, y, pressure });
                         }
-                        let _ = tx.send(TabletEvent::Move { x, y, pressure });
+                        send_event(&tx, &ctx, TabletEvent::Move { x, y, pressure });
                     }
                 }
                 _ => {}

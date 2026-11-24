@@ -2,10 +2,14 @@
 
 mod ink;
 mod recognizer;
+mod tablet;
+
+use std::sync::mpsc::{channel, Receiver};
 
 use eframe::egui;
 use ink::{Point, Stroke};
 use recognizer::{CandleRecognizer, MockRecognizer, Recognizer};
+use tablet::TabletEvent;
 
 /// Délai de pause (en secondes) après lequel on reconnaît les nouveaux strokes.
 const DEBOUNCE_SECS: f64 = 0.6;
@@ -26,10 +30,17 @@ struct InkApp {
     /// Mode debug : affiche les événements d'entrée reçus.
     debug: bool,
     debug_info: String,
+    /// Réception des événements du stylet lus via evdev.
+    tablet_rx: Option<Receiver<TabletEvent>>,
+    /// Compteur d'événements tablette reçus (pour le mode debug).
+    tablet_count: u64,
 }
 
 impl InkApp {
     fn new(recognizer: Box<dyn Recognizer>) -> Self {
+        // Lance la lecture evdev des périphériques stylet/touch en arrière-plan.
+        let (tx, rx) = channel();
+        tablet::spawn_readers(tx);
         Self {
             strokes: Vec::new(),
             current: None,
@@ -41,6 +52,31 @@ impl InkApp {
             last_touch_pos: None,
             debug: false,
             debug_info: String::new(),
+            tablet_rx: Some(rx),
+            tablet_count: 0,
+        }
+    }
+
+    /// Ajoute un point au stroke en cours (coordonnées relatives au canvas).
+    fn push_point(&mut self, p: egui::Pos2, pressure: f32, now: f64, rect: egui::Rect) {
+        if let Some(stroke) = &mut self.current {
+            stroke.push(Point {
+                x: p.x - rect.min.x,
+                y: p.y - rect.min.y,
+                t: now,
+                pressure,
+            });
+            self.last_draw_time = now;
+        }
+    }
+
+    /// Termine le stroke en cours et l'archive.
+    fn end_stroke(&mut self, now: f64) {
+        if let Some(stroke) = self.current.take() {
+            if !stroke.is_empty() {
+                self.strokes.push(stroke);
+                self.last_draw_time = now;
+            }
         }
     }
 
@@ -176,23 +212,46 @@ impl eframe::App for InkApp {
                 self.current = Some(Stroke::new());
             }
             if drawing && !touch_ended {
-                if let (Some(stroke), Some(p)) = (&mut self.current, pos) {
+                if let Some(p) = pos {
                     if rect.contains(p) {
-                        stroke.push(Point {
-                            x: p.x - rect.min.x,
-                            y: p.y - rect.min.y,
-                            t: now,
-                            pressure,
-                        });
-                        self.last_draw_time = now;
+                        self.push_point(p, pressure, now, rect);
                     }
                 }
             }
             if released || touch_ended {
-                if let Some(stroke) = self.current.take() {
-                    if !stroke.is_empty() {
-                        self.strokes.push(stroke);
-                        self.last_draw_time = now;
+                self.end_stroke(now);
+            }
+
+            // Tracé au stylet lu directement via evdev (winit ne remonte pas
+            // toujours le périphérique à egui). Coordonnées normalisées 0..1
+            // de l'écran -> points UI via le screen_rect.
+            let mut tablet_events = Vec::new();
+            if let Some(rx) = &self.tablet_rx {
+                while let Ok(ev) = rx.try_recv() {
+                    tablet_events.push(ev);
+                }
+            }
+            if !tablet_events.is_empty() {
+                let screen = ui.ctx().viewport_rect();
+                for ev in tablet_events {
+                    self.tablet_count += 1;
+                    match ev {
+                        TabletEvent::Down { x, y, pressure } => {
+                            let p = egui::pos2(x * screen.width(), y * screen.height());
+                            if rect.contains(p) {
+                                self.current = Some(Stroke::new());
+                                self.push_point(p, pressure, now, rect);
+                            }
+                        }
+                        TabletEvent::Move { x, y, pressure } => {
+                            let p = egui::pos2(x * screen.width(), y * screen.height());
+                            if rect.contains(p) {
+                                self.push_point(p, pressure, now, rect);
+                            }
+                        }
+                        TabletEvent::Up => {
+                            self.end_stroke(now);
+                        }
                     }
                 }
             }
@@ -230,6 +289,8 @@ impl eframe::App for InkApp {
                         evs.join("\n")
                     )
                 });
+                self.debug_info
+                    .push_str(&format!("\ntablet events: {}", self.tablet_count));
             }
         });
 

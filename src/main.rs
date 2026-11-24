@@ -19,6 +19,13 @@ struct InkApp {
     /// Temps (s) du dernier point tracé.
     last_draw_time: f64,
     recognizer: Box<dyn Recognizer>,
+    /// Un touch (stylet/doigt) est actuellement actif.
+    touch_active: bool,
+    /// Dernière position connue d'un touch (si le backend n'émule pas la souris).
+    last_touch_pos: Option<egui::Pos2>,
+    /// Mode debug : affiche les événements d'entrée reçus.
+    debug: bool,
+    debug_info: String,
 }
 
 impl InkApp {
@@ -30,6 +37,10 @@ impl InkApp {
             recognized_up_to: 0,
             last_draw_time: 0.0,
             recognizer,
+            touch_active: false,
+            last_touch_pos: None,
+            debug: false,
+            debug_info: String::new(),
         }
     }
 
@@ -83,6 +94,7 @@ impl eframe::App for InkApp {
                     self.recognized_up_to = 0;
                 }
                 ui.label(format!("{} strokes", self.strokes.len()));
+                ui.checkbox(&mut self.debug, "debug");
             });
         });
 
@@ -91,6 +103,9 @@ impl eframe::App for InkApp {
                 ui.label("Texte reconnu :");
                 ui.label(egui::RichText::new(&self.result).monospace());
             });
+            if self.debug {
+                ui.label(egui::RichText::new(&self.debug_info).monospace().small());
+            }
         });
 
         egui::CentralPanel::default().show(ui, |ui| {
@@ -108,30 +123,113 @@ impl eframe::App for InkApp {
                 draw_stroke(&painter, stroke, response.rect);
             }
 
-            // Capture du tracé.
+            // Capture du tracé. On ne se fie pas qu'à la Response du canvas :
+            // on lit l'état global du pointer (souris, ou stylet émulé en
+            // bouton principal) ET les événements touch bruts — un stylet
+            // sous Wayland arrive en Event::Touch avec une force (pression).
             let now = ui.input(|i| i.time);
-            if response.drag_started() {
+            let rect = response.rect;
+
+            let (mut touch_started, mut touch_ended, mut pressure, mut touch_pos) =
+                (false, false, 1.0f32, None);
+            ui.input(|i| {
+                for ev in &i.events {
+                    if let egui::Event::Touch { phase, pos, force, .. } = ev {
+                        match phase {
+                            egui::TouchPhase::Start => {
+                                touch_started = true;
+                                touch_pos = Some(*pos);
+                            }
+                            egui::TouchPhase::Move => {
+                                touch_pos = Some(*pos);
+                            }
+                            egui::TouchPhase::End | egui::TouchPhase::Cancel => {
+                                touch_ended = true;
+                            }
+                        }
+                        if let Some(f) = force {
+                            pressure = *f;
+                        }
+                    }
+                }
+            });
+            if touch_started {
+                self.touch_active = true;
+            }
+            if let Some(p) = touch_pos {
+                self.last_touch_pos = Some(p);
+            }
+            if touch_ended {
+                self.touch_active = false;
+                self.last_touch_pos = None;
+            }
+
+            let (pressed, down, released, pointer_pos) = ui.input(|i| {
+                let p = &i.pointer;
+                (p.any_pressed(), p.any_down(), p.any_released(), p.latest_pos())
+            });
+            let pos = pointer_pos.or(self.last_touch_pos);
+            let pos_in = pos.filter(|p| rect.contains(*p));
+            let drawing = down || self.touch_active;
+
+            if (pressed || touch_started) && pos_in.is_some() {
                 self.current = Some(Stroke::new());
             }
-            if response.dragged() {
-                if let Some(stroke) = &mut self.current {
-                    let pos = response.hover_pos().unwrap_or(response.rect.min);
-                    stroke.push(Point {
-                        x: pos.x - response.rect.min.x,
-                        y: pos.y - response.rect.min.y,
-                        t: now,
-                        pressure: 1.0,
-                    });
-                    self.last_draw_time = now;
+            if drawing && !touch_ended {
+                if let (Some(stroke), Some(p)) = (&mut self.current, pos) {
+                    if rect.contains(p) {
+                        stroke.push(Point {
+                            x: p.x - rect.min.x,
+                            y: p.y - rect.min.y,
+                            t: now,
+                            pressure,
+                        });
+                        self.last_draw_time = now;
+                    }
                 }
             }
-            if response.drag_stopped() {
+            if released || touch_ended {
                 if let Some(stroke) = self.current.take() {
                     if !stroke.is_empty() {
                         self.strokes.push(stroke);
                         self.last_draw_time = now;
                     }
                 }
+            }
+
+            // Mode debug : remonte ce que egui reçoit comme entrée.
+            if self.debug {
+                self.debug_info = ui.input(|i| {
+                    let evs: Vec<String> = i
+                        .events
+                        .iter()
+                        .filter_map(|ev| match ev {
+                            egui::Event::PointerButton { button, pressed, pos, .. } => Some(
+                                format!(
+                                    "button {:?} {} @ {:.0},{:.0}",
+                                    button,
+                                    if *pressed { "down" } else { "up" },
+                                    pos.x,
+                                    pos.y
+                                ),
+                            ),
+                            egui::Event::Touch { phase, pos, force, .. } => Some(format!(
+                                "touch {:?} @ {:.0},{:.0} force={:?}",
+                                phase, pos.x, pos.y, force
+                            )),
+                            _ => None,
+                        })
+                        .collect();
+                    format!(
+                        "down={} pressed={} released={} any_touches={} pos={:?}\n{}",
+                        i.pointer.any_down(),
+                        i.pointer.any_pressed(),
+                        i.pointer.any_released(),
+                        i.any_touches(),
+                        i.pointer.latest_pos(),
+                        evs.join("\n")
+                    )
+                });
             }
         });
 

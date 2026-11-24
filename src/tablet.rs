@@ -109,10 +109,24 @@ fn read_loop(path: String, tx: Sender<TabletEvent>) {
     let max_y = max_of(AbsoluteAxisCode::ABS_Y);
     let max_p = max_of(AbsoluteAxisCode::ABS_PRESSURE);
 
+    // Contact réel : BTN_TOUCH (pointe ou doigt au contact). BTN_TOOL_PEN
+    // passe à 1 dès la proximité (hover), avant le contact : on ne l'utilise
+    // que si le périphérique n'a pas BTN_TOUCH.
+    let contact_code = if dev
+        .supported_keys()
+        .map(|k| k.contains(KeyCode::BTN_TOUCH))
+        .unwrap_or(false)
+    {
+        KeyCode::BTN_TOUCH.0
+    } else {
+        KeyCode::BTN_TOOL_PEN.0
+    };
+
     let mut x = 0.0f32;
     let mut y = 0.0f32;
     let mut pressure = 1.0f32;
     let mut down = false;
+    let mut just_started = false;
 
     // fetch_events() fait un read() bloquant (fd en mode bloquant) puis
     // retourne les événements d'un batch ; il faut le rappeler en boucle,
@@ -127,10 +141,10 @@ fn read_loop(path: String, tx: Sender<TabletEvent>) {
             let value = ev.value();
             match ev.event_type() {
                 EventType::KEY => {
-                    if code == KeyCode::BTN_TOUCH.0 || code == KeyCode::BTN_TOOL_PEN.0 {
+                    if code == contact_code {
                         if value == 1 && !down {
                             down = true;
-                            let _ = tx.send(TabletEvent::Down { x, y, pressure });
+                            just_started = true;
                         } else if value == 0 && down {
                             down = false;
                             let _ = tx.send(TabletEvent::Up);
@@ -151,8 +165,14 @@ fn read_loop(path: String, tx: Sender<TabletEvent>) {
                     }
                 }
                 // Fin d'un paquet d'événements atomique : on émet le point.
+                // Le Down est émis ici (et pas au BTN_TOUCH) pour que les
+                // coordonnées x/y soient à jour au moment du contact.
                 EventType::SYNCHRONIZATION => {
                     if down {
+                        if just_started {
+                            just_started = false;
+                            let _ = tx.send(TabletEvent::Down { x, y, pressure });
+                        }
                         let _ = tx.send(TabletEvent::Move { x, y, pressure });
                     }
                 }

@@ -5,8 +5,8 @@
 //!
 //! Nécessite les droits de lecture sur /dev/input/event* (groupe `input`) :
 //! `sudo usermod -aG input $USER` puis re-login.
-//! Variable d'env optionnelle : ECRITURE_TABLET_DEVICE=/dev/input/eventN
-//! pour forcer un périphérique précis.
+//! Périphérique forcé : option CLI `--tablet-device /dev/input/eventN`,
+//! ou variable d'env ECRITURE_TABLET_DEVICE=/dev/input/eventN.
 
 use std::sync::mpsc::Sender;
 use std::thread;
@@ -22,10 +22,12 @@ pub enum TabletEvent {
 }
 
 /// Lance un thread de lecture pour chaque périphérique tablette/stylet trouvé.
-pub fn spawn_readers(tx: Sender<TabletEvent>) {
-    let paths = match std::env::var("ECRITURE_TABLET_DEVICE") {
-        Ok(p) => vec![p],
-        Err(_) => list_event_devices(),
+/// `device` force un périphérique précis ; sinon variable d'env
+/// ECRITURE_TABLET_DEVICE ; sinon auto-détection sur /dev/input/event*.
+pub fn spawn_readers(tx: Sender<TabletEvent>, device: Option<String>) {
+    let paths = match device.or_else(|| std::env::var("ECRITURE_TABLET_DEVICE").ok()) {
+        Some(p) => vec![p],
+        None => list_event_devices(),
     };
     let mut spawned = 0;
     for path in &paths {

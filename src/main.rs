@@ -37,10 +37,10 @@ struct InkApp {
 }
 
 impl InkApp {
-    fn new(recognizer: Box<dyn Recognizer>) -> Self {
+    fn new(recognizer: Box<dyn Recognizer>, tablet_device: Option<String>) -> Self {
         // Lance la lecture evdev des périphériques stylet/touch en arrière-plan.
         let (tx, rx) = channel();
-        tablet::spawn_readers(tx);
+        tablet::spawn_readers(tx, tablet_device);
         Self {
             strokes: Vec::new(),
             current: None,
@@ -322,18 +322,22 @@ fn draw_stroke(painter: &egui::Painter, stroke: &Stroke, rect: egui::Rect) {
     ));
 }
 
-/// Configuration du modèle de reconnaissance (args CLI).
+/// Configuration (args CLI).
 struct Config {
     model: String,
     chars: String,
     input_h: u32,
     norm: Norm,
+    /// Périphérique tablette forcé (ex. /dev/input/event9).
+    tablet_device: Option<String>,
 }
 
 fn usage_exit() -> ! {
     eprintln!(
         "usage: ecriture-rs [--model PATH] [--chars PATH] [--input-h N] [--norm 01|neg1]\n\
-         défauts: --model model.onnx --chars chars.txt --input-h 64 --norm 01"
+         \x20         [--tablet-device /dev/input/eventN]\n\
+         défauts: --model model.onnx --chars chars.txt --input-h 64 --norm 01,\n\
+         \x20         tablette: auto-détection (ou ECRITURE_TABLET_DEVICE)"
     );
     std::process::exit(2)
 }
@@ -344,6 +348,7 @@ fn parse_args() -> Config {
         chars: "chars.txt".to_string(),
         input_h: 64,
         norm: Norm::ZeroOne,
+        tablet_device: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -363,6 +368,9 @@ fn parse_args() -> Config {
                     _ => usage_exit(),
                 }
             }
+            "--tablet-device" => {
+                cfg.tablet_device = Some(args.next().unwrap_or_else(|| usage_exit()))
+            }
             "-h" | "--help" => usage_exit(),
             other => {
                 eprintln!("argument inconnu: {other}");
@@ -376,8 +384,8 @@ fn parse_args() -> Config {
 fn main() -> eframe::Result<()> {
     let cfg = parse_args();
     eprintln!(
-        "config: model={} chars={} input_h={} norm={:?}",
-        cfg.model, cfg.chars, cfg.input_h, cfg.norm
+        "config: model={} chars={} input_h={} norm={:?} tablet_device={:?}",
+        cfg.model, cfg.chars, cfg.input_h, cfg.norm, cfg.tablet_device
     );
     let options = eframe::NativeOptions::default();
     eframe::run_native(
@@ -393,7 +401,7 @@ fn main() -> eframe::Result<()> {
                         Box::new(MockRecognizer)
                     }
                 };
-            Ok(Box::new(InkApp::new(recognizer)))
+            Ok(Box::new(InkApp::new(recognizer, cfg.tablet_device.clone())))
         }),
     )
 }

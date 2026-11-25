@@ -68,19 +68,42 @@ pub struct PylaiaCrnn {
     linear: Linear,
 }
 
-impl PylaiaCrnn {
-    /// Charge depuis weights.ckpt. `features` = [12, 24, 48, 48], hidden = 256, layers = 3.
-    pub fn load(pth_path: &Path, num_classes: usize, hidden: usize, layers: usize, device: &Device) -> Result<Self> {
-        let mut archive = pthrs::PthArchive::open(pth_path)
-            .with_context(|| format!("ouverture du checkpoint {}", pth_path.display()))?;
+/// Charge un state_dict PyLaIA depuis un fichier, quel que soit le format :
+/// - `.safetensors` : lu nativement par candle (format standard, partagé tel quel)
+/// - `.ckpt` / `.pth` / `.bin` : state_dict torch lu via pthrs
+/// Le préfixe "model." du ckpt PyLaIA est retiré dans les deux cas.
+fn load_state_dict(path: &Path, device: &Device) -> Result<HashMap<String, Tensor>> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let mut map = HashMap::new();
+    if ext == "safetensors" {
+        let tensors = candle_core::safetensors::load(path, device)
+            .with_context(|| format!("lecture safetensors {}", path.display()))?;
+        for (name, t) in tensors {
+            let name = name.strip_prefix("model.").unwrap_or(&name).to_string();
+            map.insert(name, t);
+        }
+    } else {
+        let mut archive = pthrs::PthArchive::open(path)
+            .with_context(|| format!("ouverture du checkpoint {}", path.display()))?;
         let tensors = archive.load_floating_f32()?;
-        let mut map = HashMap::new();
         for (name, t) in tensors {
             let (shape, values) = t.into_shape_and_values()?;
-            // le ckpt PyLaIA préfixe tout par "model."
             let name = name.strip_prefix("model.").unwrap_or(&name).to_string();
             map.insert(name, Tensor::from_vec(values, shape, device)?);
         }
+    }
+    Ok(map)
+}
+
+impl PylaiaCrnn {
+    /// Charge depuis weights.ckpt (torch) ou weights.safetensors.
+    /// `features` = [12, 24, 48, 48], hidden = 256, layers = 3.
+    pub fn load(pth_path: &Path, num_classes: usize, hidden: usize, layers: usize, device: &Device) -> Result<Self> {
+        let map = load_state_dict(pth_path, device)?;
         let vb = VarBuilder::from_tensors(map, DType::F32, device);
 
         // 4 blocs : channels 12, 24, 48, 48 ; pool (2,2) sur les 3 premiers.

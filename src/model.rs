@@ -76,7 +76,10 @@ pub fn load_charset(vocab_path: &Path) -> Result<Vec<char>> {
     Ok(chars)
 }
 
-/// Télécharge les fichiers d'un dépôt HF modèle. Deux formats :
+/// Télécharge les fichiers d'un dépôt HF modèle. Trois formats détectés :
+/// - PyLaIA (ex. Teklia/pylaia-rimes) : syms.txt présent -> weights.ckpt + syms.txt
+///   (on renvoie syms.txt comme "vocab" et "config" ; la détection PyLaIA dans
+///   main.rs se fait via syms.txt à côté du checkpoint, donc dans le même cache HF)
 /// - "Sachin-0001" (IAM) : model.pth + vocab.json + config.json
 /// - doctR (ex. modèle français) : pytorch_model.bin + config.json (le vocab
 ///   est dans le config.json ; on renvoie config.json comme "vocab").
@@ -84,6 +87,18 @@ pub fn download_model_files(repo: &str) -> Result<(PathBuf, PathBuf, PathBuf)> {
     let client = hf_hub::HFClientSync::new().context("client Hugging Face")?;
     let (owner, name) = hf_hub::split_id(repo);
     let repo_hf = client.model(owner, name);
+
+    // Détection PyLaIA : un syms.txt à la racine du dépôt = modèle PyLaIA
+    // (weights.ckpt + syms.txt, ex. Teklia/pylaia-rimes).
+    if let Ok(syms) = repo_hf.download_file().filename("syms.txt").send() {
+        let ckpt = repo_hf
+            .download_file()
+            .filename("weights.ckpt")
+            .send()
+            .with_context(|| format!("téléchargement weights.ckpt depuis {repo}"))?;
+        return Ok((ckpt, syms.clone(), syms));
+    }
+
     let config = repo_hf
         .download_file()
         .filename("config.json")
@@ -111,6 +126,85 @@ pub fn download_model_files(repo: &str) -> Result<(PathBuf, PathBuf, PathBuf)> {
             .with_context(|| format!("téléchargement vocab.json depuis {repo}"))?;
         Ok((pth, vocab, config))
     }
+}
+
+/// Dossier de cache local partagé pour les poids distribués hors HF
+/// (`~/.cache/ecriture-rs/`).
+pub fn cache_dir() -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    home.join(".cache").join("ecriture-rs")
+}
+
+/// Télécharge `files` depuis `<base_url>/<file>` dans `dir` (cache local).
+/// Un fichier déjà présent et non vide n'est pas retéléchargé.
+/// Un HTTP 404 est toléré (fichier absent = on passe au suivant, utile pour
+/// essayer weights.safetensors puis weights.ckpt) ; toute autre erreur stoppe.
+/// `base_url` peut être une GitHub Release, un S3, un serveur perso, etc.
+/// Retourne la liste des fichiers effectivement présents après téléchargement.
+pub fn download_weights_from_url(base_url: &str, dir: &Path, files: &[&str]) -> Result<Vec<PathBuf>> {
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("création du cache {}", dir.display()))?;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(600))
+        .build()
+        .context("client HTTP")?;
+    let mut out = Vec::new();
+    for f in files {
+        let dest = dir.join(f);
+        if dest.exists() && std::fs::metadata(&dest).map(|m| m.len() > 0).unwrap_or(false) {
+            out.push(dest);
+            continue;
+        }
+        let url = format!("{}/{}", base_url.trim_end_matches('/'), f);
+        eprintln!("téléchargement {url} -> {}", dest.display());
+        let resp = client
+            .get(&url)
+            .send()
+            .with_context(|| format!("GET {url}"))?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            eprintln!("  absent (404), on essaie la variante suivante");
+            continue;
+        }
+        if !resp.status().is_success() {
+            anyhow::bail!("HTTP {} pour {url}", resp.status());
+        }
+        let bytes = resp.bytes().with_context(|| format!("lecture du corps {url}"))?;
+        std::fs::write(&dest, &bytes).with_context(|| format!("écriture {}", dest.display()))?;
+        out.push(dest);
+    }
+    Ok(out)
+}
+
+/// Cherche un modèle PyLaIA local (weights.safetensors / weights.ckpt / weights.pth
+/// + syms.txt au même endroit) dans les emplacements de distribution par défaut :
+/// 1. à côté de l'exécutable (zip distribué avec le binaire + les poids)
+/// 2. dans le répertoire courant
+/// 3. dans le cache local ~/.cache/ecriture-rs/pylaia-rimes/
+/// Retourne (poids, syms.txt) si trouvé, None sinon.
+pub fn find_local_pylaia() -> Option<(PathBuf, PathBuf)> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(d) = exe.parent() {
+            dirs.push(d.to_path_buf());
+        }
+    }
+    dirs.push(PathBuf::from("."));
+    dirs.push(cache_dir().join("pylaia-rimes"));
+    for d in dirs {
+        let syms = d.join("syms.txt");
+        if !syms.exists() {
+            continue;
+        }
+        for w in ["weights.safetensors", "weights.ckpt", "weights.pth"] {
+            let p = d.join(w);
+            if p.exists() {
+                return Some((p, syms));
+            }
+        }
+    }
+    None
 }
 
 /// CRNN : CNN (7 couches) -> BiLSTM 2 couches -> Linear -> log_softmax.

@@ -416,6 +416,11 @@ fn draw_stroke(painter: &egui::Painter, stroke: &Stroke, rect: egui::Rect) {
 struct Config {
     /// Checkpoint .pth local ; vocab.json et config.json attendus à côté.
     pth: Option<String>,
+    /// URL de base (hors HF) pour télécharger weights + syms.txt PyLaIA dans
+    /// le cache local ~/.cache/ecriture-rs/pylaia-rimes/ (GitHub Release, S3...).
+    weights_url: Option<String>,
+    /// Dossier local contenant weights.ckpt/weights.safetensors + syms.txt.
+    weights_dir: Option<String>,
     /// Dépôt Hugging Face téléchargé si --pth absent (modèle par défaut).
     repo: String,
     /// Hauteur d'entrée du modèle (défaut: image_height du config.json, ou
@@ -452,7 +457,19 @@ fn usage_exit() -> ! {
          \x20           cargo run --release -- --pth ~/modeles/pylaia-rimes/weights.ckpt\n\
          \x20         - config.json avec arch/vocab -> doctR (pytorch_model.bin + config.json)\n\
          \x20         - sinon Sachin-0001 (model.pth + vocab.json + config.json)\n\
-         --repo Felix92/doctr-torch-crnn-mobilenet-v3-large-french : doctR FR téléchargé"
+         --repo owner/name : téléchargé depuis Hugging Face (cache auto), format détecté :\n\
+         \x20         - syms.txt dans le dépôt -> PyLaIA : --repo Teklia/pylaia-rimes (FR, weights.ckpt auto)\n\
+         \x20         - config.json arch/vocab -> doctR : --repo Felix92/doctr-torch-crnn-mobilenet-v3-large-french\n\
+         \x20         - sinon Sachin-0001/crnn-iam-handwriting (défaut, anglais)\n\
+         \n\
+         Partage des poids PyLaIA hors HF (modèle non distribué sur HF en Rust) :\n\
+         \x20 --weights-url BASE  : télécharge BASE/weights.ckpt + BASE/syms.txt (ou\n\
+         \x20                       weights.safetensors) dans ~/.cache/ecriture-rs/pylaia-rimes/\n\
+         \x20                       (GitHub Release, S3, serveur perso...) au 1er lancement\n\
+         \x20 --weights-dir DIR   : dossier local contenant weights.* + syms.txt\n\
+         \x20 sans option           : cherche weights.* + syms.txt à côté du binaire,\n\
+         \x20                       dans ./ et dans le cache local (zip distribué avec les poids)\n\
+         Priorité : --pth > --weights-url > --weights-dir > auto-local > --repo"
     );
     std::process::exit(2)
 }
@@ -460,6 +477,8 @@ fn usage_exit() -> ! {
 fn parse_args() -> Config {
     let mut cfg = Config {
         pth: None,
+        weights_url: None,
+        weights_dir: None,
         repo: "Sachin-0001/crnn-iam-handwriting".to_string(),
         input_h: None,
         input_w: None,
@@ -474,6 +493,8 @@ fn parse_args() -> Config {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--pth" => cfg.pth = Some(args.next().unwrap_or_else(|| usage_exit())),
+            "--weights-url" => cfg.weights_url = Some(args.next().unwrap_or_else(|| usage_exit())),
+            "--weights-dir" => cfg.weights_dir = Some(args.next().unwrap_or_else(|| usage_exit())),
             "--repo" => cfg.repo = args.next().unwrap_or_else(|| usage_exit()),
             "--input-h" => {
                 cfg.input_h = Some(
@@ -531,25 +552,72 @@ fn parse_args() -> Config {
 fn main() -> eframe::Result<()> {
     let cfg = parse_args();
 
-    // Résout les fichiers du modèle : locaux (--pth + vocab.json/config.json
-    // à côté) ou téléchargés depuis le dépôt HF (--repo).
-    let (pth, vocab_json, config_json) = match &cfg.pth {
-        Some(p) => {
-            let p = PathBuf::from(p);
-            let dir = p.parent().map(|d| d.to_path_buf()).unwrap_or_default();
-            (p, dir.join("vocab.json"), dir.join("config.json"))
+    // Résout les fichiers du modèle. Priorité :
+    //   --pth > --weights-url (téléchargé dans le cache local) > --weights-dir
+    //   > auto-local (poids à côté du binaire / CWD / cache) > --repo (HF).
+    // Pour PyLaIA, "vocab_json"/"config_json" pointent vers syms.txt (la
+    // détection du backend se fait via syms.txt à côté du checkpoint).
+    let nonexistent = || {
+        (
+            PathBuf::from("/nonexistent/model.pth"),
+            PathBuf::from("/nonexistent/vocab.json"),
+            PathBuf::from("/nonexistent/config.json"),
+        )
+    };
+    let (pth, vocab_json, config_json) = if let Some(p) = &cfg.pth {
+        let p = PathBuf::from(p);
+        let dir = p.parent().map(|d| d.to_path_buf()).unwrap_or_default();
+        (p, dir.join("vocab.json"), dir.join("config.json"))
+    } else if let Some(base) = &cfg.weights_url {
+        // Télécharge weights + syms depuis une URL custom (hors HF) dans le
+        // cache local, puis les utilise comme un --pth local.
+        let dir = model::cache_dir().join("pylaia-rimes");
+        match model::download_weights_from_url(base, &dir, &["weights.safetensors", "weights.ckpt", "syms.txt"]) {
+            Ok(paths) => {
+                let syms = dir.join("syms.txt");
+                let weights = paths
+                    .iter()
+                    .find(|p| p.file_name().map(|n| n == "weights.safetensors").unwrap_or(false))
+                    .or_else(|| paths.iter().find(|p| p.file_name().map(|n| n == "weights.ckpt").unwrap_or(false)))
+                    .cloned();
+                match weights {
+                    Some(w) if syms.exists() => (w, syms.clone(), syms),
+                    _ => {
+                        eprintln!("--weights-url {base} : fichiers retrouvés incomplets : MockRecognizer");
+                        nonexistent()
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("--weights-url {base} impossible ({e:#}) : MockRecognizer");
+                nonexistent()
+            }
         }
-        None => match model::download_model_files(&cfg.repo) {
+    } else if let Some(d) = &cfg.weights_dir {
+        let d = PathBuf::from(d);
+        let syms = d.join("syms.txt");
+        let weights = ["weights.safetensors", "weights.ckpt", "weights.pth"]
+            .iter()
+            .map(|w| d.join(w))
+            .find(|p| p.exists());
+        match weights {
+            Some(w) if syms.exists() => (w, syms.clone(), syms),
+            _ => {
+                eprintln!("--weights-dir {} : weights.*/syms.txt manquants : MockRecognizer", d.display());
+                nonexistent()
+            }
+        }
+    } else if let Some((w, syms)) = model::find_local_pylaia() {
+        eprintln!("poids PyLaIA trouvés localement : {}", w.display());
+        (w, syms.clone(), syms)
+    } else {
+        match model::download_model_files(&cfg.repo) {
             Ok(paths) => paths,
             Err(e) => {
                 eprintln!("téléchargement HF impossible ({e:#}) : MockRecognizer");
-                (
-                    PathBuf::from("/nonexistent/model.pth"),
-                    PathBuf::from("/nonexistent/vocab.json"),
-                    PathBuf::from("/nonexistent/config.json"),
-                )
+                nonexistent()
             }
-        },
+        }
     };
     let config_text = std::fs::read_to_string(&config_json).unwrap_or_default();
     let mconfig: model::ModelConfig =

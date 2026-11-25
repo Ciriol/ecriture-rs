@@ -27,7 +27,7 @@ beam search CTC N-best (src/recognizer.rs) + rescoring par lexique de langue
 - **Stylet Linux** : lu directement via evdev (`src/tablet.rs`) quand winit ne remonte rien ; contact détecté par `BTN_TOUCH`/pression, coordonnées normalisées depuis les bornes du périphérique, pression `ABS_PRESSURE` conservée dans chaque point.
 - **Modèles** : 3 backends CRNN-CTC, tous chargés en pur Rust depuis un checkpoint torch (`pthrs`), inférence CPU via candle :
   - `Sachin-0001/crnn-iam-handwriting` (défaut, anglais, IAM) : `model.pth` + `vocab.json` + `config.json`
-  - **PyLaIA `Teklia/pylaia-rimes` (français, CER ~4.5% sur RIMES)** : `weights.ckpt` + `syms.txt` — lancer avec `--pth ~/modeles/pylaia-rimes/weights.ckpt` (détection auto via `syms.txt`)
+  - **PyLaIA `Teklia/pylaia-rimes` (français, CER ~4.5% sur RIMES)** : `weights.ckpt` + `syms.txt` — lancer avec `--repo Teklia/pylaia-rimes` (téléchargement auto HF) ou `--pth ~/modeles/pylaia-rimes/weights.ckpt` (détection auto via `syms.txt`)
   - doctR `crnn_mobilenet_v3_large` : `pytorch_model.bin` + `config.json` (détection auto via `arch`/`vocab` dans le config)
   Les 3 backends sont validés bit-à-bit contre PyTorch (tests `parite_*` : logits max|diff| < 6e-5).
 
@@ -48,8 +48,13 @@ Le modèle est téléchargé au premier lancement (cache Hugging Face). Sans mod
 
 | Option CLI | Défaut | Rôle |
 |---|---|---|
-| `--repo owner/name` | `Sachin-0001/crnn-iam-handwriting` | dépôt Hugging Face du modèle (model.pth, vocab.json, config.json) |
+| `--repo owner/name` | `Sachin-0001/crnn-iam-handwriting` | dépôt Hugging Face du modèle, téléchargé automatiquement (cache HF). Format détecté : `syms.txt` dans le dépôt → PyLaIA (`--repo Teklia/pylaia-rimes`, FR), `arch`/`vocab` dans config.json → doctR, sinon Sachin (`model.pth` + `vocab.json` + `config.json`) |
 | `--pth PATH` | — | checkpoint local ; le format est détecté depuis les fichiers à côté : `syms.txt` → PyLaIA (ex. `--pth ~/modeles/pylaia-rimes/weights.ckpt`), `arch`/`vocab` dans config.json → doctR, sinon Sachin (`model.pth` + `vocab.json` + `config.json`) |
+| `--weights-url BASE` | — | partage des poids PyLaIA hors HF : télécharge `BASE/weights.safetensors` (puis `weights.ckpt` en secours) + `BASE/syms.txt` dans `~/.cache/ecriture-rs/pylaia-rimes/` au 1er lancement (GitHub Release, S3, serveur perso...) |
+| `--weights-dir DIR` | — | dossier local contenant `weights.safetensors`/`weights.ckpt` + `syms.txt` |
+| *(auto)* | — | sans option de modèle, cherche `weights.*` + `syms.txt` à côté du binaire, dans `./` et dans `~/.cache/ecriture-rs/pylaia-rimes/` → permet de distribuer un zip `ecriture-rs` + poids |
+
+Priorité de résolution : `--pth` > `--weights-url` > `--weights-dir` > auto-local > `--repo` (HF).
 | `--input-h N` | `image_height` du config.json (32) | hauteur de redimensionnement de l'image d'entrée. Toute valeur ≥ 32 fonctionne avec le CRNN (pool vertical adaptatif en fin de CNN) ; 32 = défaut du modèle IAM |
 | `--norm 01\|neg1` | `neg1` | normalisation des pixels : `01` = 0..1 (blanc=1), `neg1` = -1..1 |
 | `--tablet-device /dev/input/eventN` | auto-détection | périphérique tablette forcé (ou env `ECRITURE_TABLET_DEVICE`) |
@@ -63,9 +68,21 @@ Dans l'UI : tracer dans la zone centrale, **Reconnaître** (tout relire), **Effa
 Exemples avec un modèle local :
 
 ```bash
-# modèle français PyLaIA (RIMES) : télécharger weights.ckpt + syms.txt depuis
-# https://huggingface.co/Teklia/pylaia-rimes dans ~/modeles/pylaia-rimes/
+# modèle français PyLaIA (RIMES) : téléchargé automatiquement depuis
+# https://huggingface.co/Teklia/pylaia-rimes (weights.ckpt + syms.txt, cache HF)
+cargo run --release -- --repo Teklia/pylaia-rimes
+
+# idem, avec les fichiers locaux déjà téléchargés dans ~/modeles/pylaia-rimes/ :
 cargo run --release -- --pth ~/modeles/pylaia-rimes/weights.ckpt
+
+# partage des poids PyLaIA hors HF (modèle non distribué sur HF en Rust) :
+# 1) convertir en safetensors (42 Mo -> 20 Mo f32, 10 Mo f16) :
+cargo run --release --example to_safetensors -- ~/modeles/pylaia-rimes/weights.ckpt weights.safetensors f16
+# 2) distribuer un zip avec le binaire + weights.safetensors + syms.txt
+#    (détectés automatiquement à côté de l'exécutable), ou les héberger :
+cargo run --release -- --weights-url https://github.com/vous/ecriture-rs/releases/download/v1.0
+# ou pointer vers un dossier local :
+cargo run --release -- --weights-dir ./pylaia-rimes
 
 # modèle IAM Sachin local :
 cargo run --release -- --pth ~/modeles/crnn/model.pth --input-h 32 --norm neg1 --tablet-device /dev/input/event9
@@ -89,7 +106,8 @@ ecriture-rs/
 │   └── recognizer.rs   trait Recognizer, 3 backends, beam CTC N-best + rescoring lexique
 ├── examples/
 │   ├── dump_pth.rs     liste les tenseurs d'un checkpoint torch
-│   └── export_pth.rs   exporte un checkpoint en .f32 bruts (debug cross-framework)
+│   ├── export_pth.rs   exporte un checkpoint en .f32 bruts (debug cross-framework)
+│   └── to_safetensors.rs  convertit un .ckpt torch en .safetensors (f32/f16) pour partager les poids
 └── LICENSE.md
 ```
 

@@ -159,6 +159,12 @@ impl Crnn {
         x = x.max_pool2d_with_stride((2, 1), (2, 1))?;
         x = self.conv14.forward(&x)?;
         x = self.bn14.forward_t(&x, false)?.relu()?;
+        // Ramène la hauteur à 1 (pool adaptatif : toute hauteur d'entrée >= 32
+        // fonctionne, pas seulement 32 — utile avec --input-h).
+        let h = x.dim(2)?;
+        if h > 1 {
+            x = x.max_pool2d_with_stride((h, 1), (h, 1))?;
+        }
         // [N, 512, 1, W] -> [N, W, 512]
         let x = x.squeeze(2)?.permute((0, 2, 1))?.contiguous()?;
         let x = bilstm_layer(&x, &self.l0f, &self.l0r)?;
@@ -202,5 +208,11 @@ mod tests {
         assert_eq!(dims[0], 1);
         assert_eq!(dims[2], mconfig.num_classes);
         println!("logits shape: {:?}", dims);
+
+        // --input-h 48 : le pool vertical adaptatif doit accepter H=48
+        let img48 = Tensor::ones((1, 1, 48, 128), DType::F32, &device).unwrap();
+        let logits48 = model.forward(&img48).unwrap();
+        assert_eq!(logits48.dims()[2], mconfig.num_classes);
+        println!("logits shape H=48: {:?}", logits48.dims());
     }
 }

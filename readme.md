@@ -45,7 +45,7 @@ Le modèle est téléchargé au premier lancement (cache Hugging Face). Sans mod
 |---|---|---|
 | `--repo owner/name` | `Sachin-0001/crnn-iam-handwriting` | dépôt Hugging Face du modèle (model.pth, vocab.json, config.json) |
 | `--pth PATH` | — | checkpoint `.pth` local (vocab.json et config.json attendus à côté) |
-| `--input-h N` | `image_height` du config.json (32) | hauteur de l'image d'entrée du modèle |
+| `--input-h N` | `image_height` du config.json (32) | hauteur de redimensionnement de l'image d'entrée. Toute valeur ≥ 32 fonctionne avec le CRNN (pool vertical adaptatif en fin de CNN) ; 32 = défaut du modèle IAM |
 | `--norm 01\|neg1` | `neg1` | normalisation des pixels : `01` = 0..1 (blanc=1), `neg1` = -1..1 |
 | `--tablet-device /dev/input/eventN` | auto-détection | périphérique tablette forcé (ou env `ECRITURE_TABLET_DEVICE`) |
 

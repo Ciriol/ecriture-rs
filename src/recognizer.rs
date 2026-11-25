@@ -29,6 +29,12 @@ impl Norm {
 
 pub trait Recognizer {
     fn recognize(&mut self, img: &GrayImage) -> Result<String>;
+
+    /// Dernière image effectivement envoyée au modèle (après redimensionnement
+    /// à `input_h`), pour l'affichage debug. `None` pour le mock.
+    fn last_input_image(&self) -> Option<&GrayImage> {
+        None
+    }
 }
 
 /// Décodage glouton CTC : argmax par pas de temps, dédoublonnage,
@@ -65,6 +71,8 @@ pub struct CrnnRecognizer {
     device: Device,
     input_h: u32,
     norm: Norm,
+    /// Image envoyée au modèle lors du dernier appel (après resize), pour le debug.
+    last_input: Option<GrayImage>,
 }
 
 impl CrnnRecognizer {
@@ -93,10 +101,11 @@ impl CrnnRecognizer {
             device: device.clone(),
             input_h,
             norm,
+            last_input: None,
         })
     }
 
-    fn image_to_tensor(&self, img: &GrayImage) -> Result<Tensor> {
+    fn image_to_tensor(&mut self, img: &GrayImage) -> Result<Tensor> {
         // Redimensionne à hauteur fixe en gardant les proportions.
         let ratio = self.input_h as f32 / img.height() as f32;
         let w = ((img.width() as f32 * ratio) as u32).max(1);
@@ -110,8 +119,13 @@ impl CrnnRecognizer {
         for (i, p) in resized.pixels().enumerate() {
             data[i] = self.norm.apply(p.0[0] as f32 / 255.0);
         }
-        Tensor::from_vec(data, (1, 1, self.input_h as usize, w as usize), &self.device)
-            .context("construction du tenseur d'entrée")
+        self.last_input = Some(resized);
+        Tensor::from_vec(
+            data,
+            (1, 1, self.input_h as usize, w as usize),
+            &self.device,
+        )
+        .context("construction du tenseur d'entrée")
     }
 }
 
@@ -128,6 +142,10 @@ impl Recognizer for CrnnRecognizer {
             .to_vec1::<f32>()
             .context("conversion f32")?;
         Ok(ctc_greedy_decode(&flat, t, c, &self.charset))
+    }
+
+    fn last_input_image(&self) -> Option<&GrayImage> {
+        self.last_input.as_ref()
     }
 }
 

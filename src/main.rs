@@ -32,6 +32,8 @@ struct InkApp {
     /// Mode debug : affiche les événements d'entrée reçus.
     debug: bool,
     debug_info: String,
+    /// Image envoyée au modèle lors de la dernière reconnaissance (mode debug).
+    debug_img: Option<egui::ColorImage>,
     /// Réception des événements du stylet lus via evdev.
     tablet_rx: Option<Receiver<TabletEvent>>,
     /// Compteur d'événements tablette reçus (pour le mode debug).
@@ -55,6 +57,7 @@ impl InkApp {
             last_touch_pos: None,
             debug: false,
             debug_info: String::new(),
+            debug_img: None,
             tablet_rx: Some(rx),
             tablet_count: 0,
         }
@@ -94,6 +97,7 @@ impl InkApp {
             Ok(text) => self.result = text,
             Err(e) => self.result = format!("erreur: {e:#}"),
         }
+        self.update_debug_img();
         self.recognized_up_to = self.strokes.len();
     }
 
@@ -114,7 +118,20 @@ impl InkApp {
             }
             Err(e) => self.result = format!("erreur: {e:#}"),
         }
+        self.update_debug_img();
         self.recognized_up_to = self.strokes.len();
+    }
+
+    /// En mode debug, récupère l'image envoyée au modèle pour l'afficher.
+    fn update_debug_img(&mut self) {
+        if self.debug {
+            self.debug_img = self.recognizer.last_input_image().map(|g| {
+                egui::ColorImage::from_gray(
+                    [g.width() as usize, g.height() as usize],
+                    g.as_raw(),
+                )
+            });
+        }
     }
 }
 
@@ -314,6 +331,19 @@ impl eframe::App for InkApp {
         } else if pending > 0 {
             // On reprogramme un rafraîchissement pour surveiller la pause.
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+        }
+
+        // Mode debug : image envoyée au modèle, affichée en haut à droite (x4).
+        if self.debug && let Some(ci) = &self.debug_img {
+            let tex = ui
+                .ctx()
+                .load_texture("debug_input", ci.clone(), egui::TextureOptions::NEAREST);
+            let size = egui::vec2(ci.width() as f32 * 4.0, ci.height() as f32 * 4.0);
+            egui::Window::new(format!("image modèle {}x{}", ci.width(), ci.height()))
+                .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-8.0, 8.0))
+                .show(ui.ctx(), |ui| {
+                    ui.add(egui::Image::new(&tex).fit_to_exact_size(size));
+                });
         }
     }
 }

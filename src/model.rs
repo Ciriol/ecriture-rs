@@ -29,24 +29,27 @@ pub struct ModelConfig {
 #[derive(Deserialize)]
 struct Vocab {
     char_to_idx: HashMap<String, usize>,
-    #[allow(dead_code)]
     blank_id: usize,
 }
 
-/// Charge le charset depuis vocab.json : un caractère par classe, le blank
-/// CTC (index 0) est inséré en premier (réservé, comme avant avec chars.txt).
+/// Charge le charset depuis vocab.json : `chars[i]` = caractère de la classe `i`
+/// (l'index du modèle mappe directement sur le vecteur). Le blank CTC
+/// (`blank_id`, 0 dans la config) occupe sa propre case. Les trous éventuels
+/// entre les index du vocab sont remplis par un caractère de remplacement pour
+/// ne jamais décaler le mapping classe -> caractère.
 pub fn load_charset(vocab_path: &Path) -> Result<Vec<char>> {
     let content = std::fs::read_to_string(vocab_path)
         .with_context(|| format!("vocab introuvable: {}", vocab_path.display()))?;
     let vocab: Vocab = serde_json::from_str(&content).context("vocab.json invalide")?;
-    let mut items: Vec<(char, usize)> = vocab
-        .char_to_idx
-        .iter()
-        .filter_map(|(c, &i)| c.chars().next().map(|ch| (ch, i)))
-        .collect();
-    items.sort_by_key(|(_, i)| *i);
-    let mut chars = vec!['\u{0}']; // index 0 = blank CTC
-    chars.extend(items.into_iter().map(|(c, _)| c));
+    let blank_id = vocab.blank_id;
+    let max_idx = vocab.char_to_idx.values().copied().max().unwrap_or(0).max(blank_id);
+    let mut chars = vec!['\u{FFFD}'; max_idx + 1];
+    chars[blank_id] = '\u{0}'; // case du blank CTC
+    for (c, &i) in &vocab.char_to_idx {
+        if let Some(ch) = c.chars().next() {
+            chars[i] = ch;
+        }
+    }
     Ok(chars)
 }
 
@@ -185,6 +188,28 @@ fn bilstm_layer(x: &Tensor, fwd: &LSTM, bwd: &LSTM) -> Result<Tensor> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn load_charset_index_direct_et_trous() {
+        // vocab avec un trou (index 3 absent) : chars[3] doit rester un
+        // placeholder, pas recevoir le caractère d'index 4.
+        let dir = std::env::temp_dir().join(format!("ecriture-test-vocab-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("vocab.json");
+        std::fs::write(
+            &p,
+            r#"{"char_to_idx": {"a": 1, "b": 2, "z": 4}, "blank_id": 0}"#,
+        )
+        .unwrap();
+        let chars = load_charset(&p).unwrap();
+        assert_eq!(chars.len(), 5);
+        assert_eq!(chars[0], '\u{0}');
+        assert_eq!(chars[1], 'a');
+        assert_eq!(chars[2], 'b');
+        assert_eq!(chars[3], '\u{FFFD}');
+        assert_eq!(chars[4], 'z');
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     /// Test réel (à lancer explicitement) : télécharge le modèle HF et fait
     /// une inférence sur une image synthétique.

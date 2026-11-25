@@ -1,6 +1,7 @@
 //! UI egui : canvas d'écriture + bouton de reconnaissance.
 
 mod ink;
+mod lexicon;
 mod model;
 mod recognizer;
 mod tablet;
@@ -10,7 +11,7 @@ use std::sync::mpsc::{channel, Receiver};
 
 use eframe::egui;
 use ink::{Point, Stroke};
-use recognizer::{CrnnRecognizer, MockRecognizer, Norm, Recognizer};
+use recognizer::{CrnnRecognizer, DecodeOptions, MockRecognizer, Norm, Recognizer};
 use tablet::TabletEvent;
 
 /// Délai de pause (en secondes) après lequel on re-reconnaît la fenêtre en cours.
@@ -419,14 +420,25 @@ struct Config {
     norm: Norm,
     /// Périphérique tablette forcé (ex. /dev/input/event9).
     tablet_device: Option<String>,
+    /// Lexique de langue pour le rescoring N-best : None = lexique français
+    /// embarqué, Some("none") = désactivé, Some(path) = fichier "1 mot/ligne".
+    lexicon: Option<String>,
+    /// Largeur du beam CTC.
+    beam: usize,
+    /// Nombre d'hypothèses N-best rescorées par le lexique.
+    nbest: usize,
+    /// Poids du lexique dans le rescoring (0 = désactivé).
+    lm_weight: f64,
 }
 
 fn usage_exit() -> ! {
     eprintln!(
         "usage: ecriture-rs [--pth model.pth] [--repo owner/name] [--input-h N] [--norm 01|neg1]\n\
-         \x20         [--tablet-device /dev/input/eventN]\n\
+         \x20         [--tablet-device /dev/input/eventN] [--lexicon PATH|none] [--beam N]\n\
+         \x20         [--nbest N] [--lm-weight F]\n\
          défauts: --repo Sachin-0001/crnn-iam-handwriting (téléchargé via Hugging Face),\n\
-         \x20         --input-h depuis config.json, --norm neg1,\n\
+         \x20         --input-h depuis config.json, --norm neg1, --lexicon embarqué (français),\n\
+         \x20         --beam 16, --nbest 8, --lm-weight 2.0,\n\
          \x20         tablette: auto-détection (ou ECRITURE_TABLET_DEVICE)"
     );
     std::process::exit(2)
@@ -439,6 +451,10 @@ fn parse_args() -> Config {
         input_h: None,
         norm: Norm::NegOneOne,
         tablet_device: None,
+        lexicon: None,
+        beam: 16,
+        nbest: 8,
+        lm_weight: 2.0,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -461,6 +477,25 @@ fn parse_args() -> Config {
             }
             "--tablet-device" => {
                 cfg.tablet_device = Some(args.next().unwrap_or_else(|| usage_exit()))
+            }
+            "--lexicon" => cfg.lexicon = Some(args.next().unwrap_or_else(|| usage_exit())),
+            "--beam" => {
+                cfg.beam = args
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| usage_exit())
+            }
+            "--nbest" => {
+                cfg.nbest = args
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| usage_exit())
+            }
+            "--lm-weight" => {
+                cfg.lm_weight = args
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| usage_exit())
             }
             "-h" | "--help" => usage_exit(),
             other => {
@@ -508,14 +543,42 @@ fn main() -> eframe::Result<()> {
         },
     };
     let input_h = cfg.input_h.unwrap_or(mconfig.image_height);
+
+    // Lexique de langue pour le rescoring N-best : embarqué (français) par
+    // défaut, fichier local avec --lexicon PATH, désactivé avec --lexicon none.
+    let lexicon = match &cfg.lexicon {
+        None => Some(lexicon::Lexicon::embedded_fr()),
+        Some(p) if p == "none" || p == "-" => None,
+        Some(p) => match lexicon::Lexicon::load(std::path::Path::new(p)) {
+            Ok(l) => Some(l),
+            Err(e) => {
+                eprintln!("lexique {p} illisible ({e}) : lexique embarqué (français)");
+                Some(lexicon::Lexicon::embedded_fr())
+            }
+        },
+    };
+    let lex_info = match &lexicon {
+        Some(l) => format!("{} mots", l.len()),
+        None => "désactivé".to_string(),
+    };
     eprintln!(
-        "config: pth={} repo={} input_h={} norm={:?} tablet_device={:?}",
+        "config: pth={} repo={} input_h={} norm={:?} tablet_device={:?} beam={} nbest={} lm_weight={} lexique={}",
         pth.display(),
         cfg.repo,
         input_h,
         cfg.norm,
-        cfg.tablet_device
+        cfg.tablet_device,
+        cfg.beam,
+        cfg.nbest,
+        cfg.lm_weight,
+        lex_info,
     );
+    let decode_opts = DecodeOptions {
+        beam_size: cfg.beam,
+        nbest: cfg.nbest,
+        lm_weight: cfg.lm_weight,
+        lexicon,
+    };
 
     let options = eframe::NativeOptions::default();
     eframe::run_native(
@@ -524,13 +587,14 @@ fn main() -> eframe::Result<()> {
         Box::new(|cc| {
             let device = candle_core::Device::Cpu;
             // Modèle réel si présent, sinon bouchon pour tester l'UI.
-            let recognizer: Box<dyn Recognizer> = match CrnnRecognizer::new(
+            let recognizer: Box<dyn Recognizer> = match CrnnRecognizer::with_options(
                 &pth,
                 &vocab_json,
                 mconfig.num_classes,
                 mconfig.hidden_size,
                 input_h,
                 cfg.norm,
+                decode_opts,
                 &device,
             ) {
                 Ok(r) => Box::new(r),

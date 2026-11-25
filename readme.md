@@ -13,13 +13,14 @@ Prise de notes avec **reconnaissance d'écriture manuscrite quasi temps réel, 1
 strokes (egui souris/touch  |  evdev pour le stylet /dev/input)
         │
         ▼
-rendu en image grayscale (src/ink.rs)
+rendu en image grayscale avec marges + lissage (src/ink.rs)
         │
         ▼
 CRNN CNN-BiLSTM-CTC en candle, poids chargés depuis un .pth (src/model.rs, pthrs)
         │
         ▼
-décodage CTC glouton (src/recognizer.rs) → texte affiché
+beam search CTC N-best (src/recognizer.rs) + rescoring par lexique de langue
+(src/lexicon.rs, lexique français ~49k mots embarqué dans assets/) → texte affiché
 ```
 
 - Reconnaissance **incrémentale** : 0,6 s après la fin d'un tracé, seuls les nouveaux strokes sont reconnus et ajoutés au texte.
@@ -48,6 +49,10 @@ Le modèle est téléchargé au premier lancement (cache Hugging Face). Sans mod
 | `--input-h N` | `image_height` du config.json (32) | hauteur de redimensionnement de l'image d'entrée. Toute valeur ≥ 32 fonctionne avec le CRNN (pool vertical adaptatif en fin de CNN) ; 32 = défaut du modèle IAM |
 | `--norm 01\|neg1` | `neg1` | normalisation des pixels : `01` = 0..1 (blanc=1), `neg1` = -1..1 |
 | `--tablet-device /dev/input/eventN` | auto-détection | périphérique tablette forcé (ou env `ECRITURE_TABLET_DEVICE`) |
+| `--lexicon PATH\|none` | lexique français embarqué (`assets/lexique-fr.txt`) | fichier "1 mot par ligne" pour le rescoring N-best ; `none` désactive le lexique |
+| `--beam N` | `16` | largeur du beam search CTC (`1` = décodage glouton) |
+| `--nbest N` | `8` | nombre d'hypothèses N-best rescorées par le lexique |
+| `--lm-weight F` | `2.0` | poids du lexique : `score = logp_ctc/len + F × couverture_lexicale` (`0` = désactivé) |
 
 Dans l'UI : tracer dans la zone centrale, **Reconnaître** (tout relire), **Effacer**, case **debug** (événements d'entrée reçus).
 
@@ -62,21 +67,35 @@ cargo run --release -- --pth ~/modeles/crnn/model.pth --input-h 32 --norm neg1 -
 ```text
 ecriture-rs/
 ├── Cargo.toml
+├── assets/
+│   └── lexique-fr.txt  lexique français embarqué (~49k mots, fréquences corpus)
 ├── src/
 │   ├── main.rs         UI egui, capture souris/touch, debounce, options CLI
-│   ├── ink.rs          Point/Stroke, resample, rendu image grayscale
+│   ├── ink.rs          Point/Stroke, resample, lissage, rendu image grayscale avec marges
+│   ├── lexicon.rs      lexique de langue + couverture lexicale d'une hypothèse
 │   ├── tablet.rs       lecture evdev du stylet (thread + channel + réveil egui)
 │   ├── model.rs        CRNN candle-nn, chargement .pth (pthrs), téléchargement HF (hf-hub)
-│   └── recognizer.rs   trait Recognizer, CrnnRecognizer, décodage CTC, MockRecognizer
+│   └── recognizer.rs   trait Recognizer, CrnnRecognizer, beam CTC N-best + rescoring lexique
 └── LICENSE.md
 ```
 
 ## Tests
 
 ```bash
-cargo test                          # tests unitaires
+cargo test                          # tests unitaires (rendu, CTC greedy/beam, vocab)
 cargo test -- --ignored --nocapture # test réel : télécharge le modèle HF et infère
+# bench CER sur 10 vraies lignes IAM (extraites dans /tmp/iam_samples, voir meta.json) :
+cargo test --release -- --ignored --nocapture bench_iam
 ```
+
+Le prétraitement colle au handler officiel du modèle : rendu des strokes en image
+avec marges (la bounding box occupe 75 % de la hauteur, largeur min 2×hauteur),
+trait ~hauteur/10, lissage du bruit capteur, puis resize **bilinéaire** à
+`--input-h` (32) et normalisation `p/127.5 - 1` (équivalent `--norm neg1`).
+Décodage CTC par **beam search N-best** (`--beam`, `--nbest`) puis **rescoring par
+lexique** (`--lm-weight`, lexique français embarqué par défaut). Sur 10 échantillons
+IAM réels (lexique anglais de calibration) : CER glouton 0.1025 → beam+lexique
+**0.0968** (le modèle annonce 0.126 sur tout son test set).
 
 ## Roadmap
 

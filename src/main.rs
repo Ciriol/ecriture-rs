@@ -63,6 +63,13 @@ struct InkApp {
     cfg: Config,
     /// Options de décodage (beam, lexique...) appliquées à chaque modèle.
     decode_opts: DecodeOptions,
+    /// Label de vérité terrain pour l'export InkML (pré-rempli avec le texte
+    /// reconnu, éditable manuellement avant export).
+    export_label: String,
+    /// Dernier label auto-généré (pour ne pas écraser une correction manuelle).
+    last_auto_label: String,
+    /// Statut du dernier export InkML (chemin écrit ou erreur).
+    export_status: String,
 }
 
 impl InkApp {
@@ -124,6 +131,40 @@ impl InkApp {
             model_rx: None,
             cfg,
             decode_opts,
+            export_label: String::new(),
+            last_auto_label: String::new(),
+            export_status: String::new(),
+        }
+    }
+
+    /// Met à jour le label d'export (vérité terrain) avec le texte reconnu,
+    /// sans écraser une correction manuelle de l'utilisateur.
+    fn sync_export_label(&mut self) {
+        let mut cur = self.result.clone();
+        if !self.pending_text.is_empty() {
+            if !cur.is_empty() {
+                cur.push(' ');
+            }
+            cur.push_str(&self.pending_text);
+        }
+        if self.export_label.is_empty() || self.export_label == self.last_auto_label {
+            self.export_label = cur.clone();
+            self.last_auto_label = cur;
+        }
+    }
+
+    /// Exporte les strokes courants en InkML dans `exports/` (relatif au CWD).
+    fn do_export(&mut self) {
+        if self.strokes.is_empty() {
+            self.export_status = "rien à exporter (aucun stroke)".to_string();
+            return;
+        }
+        match export_inkml_to(std::path::Path::new("exports"), &self.strokes, &self.export_label) {
+            Ok(p) => {
+                self.export_status = format!("exporté : {}", p.display());
+                eprintln!("{}", self.export_status);
+            }
+            Err(e) => self.export_status = format!("erreur export : {e}"),
         }
     }
 
@@ -275,6 +316,7 @@ impl InkApp {
         self.update_debug_img();
         self.finalized = self.strokes.len();
         self.pending_text.clear();
+        self.sync_export_label();
     }
 
     /// Re-reconnaît la fenêtre glissante (strokes non finalisés) et REMPLACE
@@ -290,6 +332,7 @@ impl InkApp {
             Err(e) => self.pending_text = format!("erreur: {e:#}"),
         }
         self.update_debug_img();
+        self.sync_export_label();
     }
 
     /// Fige la fenêtre courante dans le texte finalisé.
@@ -302,6 +345,7 @@ impl InkApp {
         }
         self.finalized = self.strokes.len();
         self.pending_text.clear();
+        self.sync_export_label();
     }
 
     /// En mode debug, récupère l'image envoyée au modèle pour l'afficher.
@@ -340,6 +384,22 @@ impl eframe::App for InkApp {
                     self.result.clear();
                     self.pending_text.clear();
                     self.finalized = 0;
+                }
+                if ui.button("Exporter InkML").clicked() {
+                    self.do_export();
+                }
+                if !self.export_status.is_empty() {
+                    let ok = self.export_status.starts_with("exporté");
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(&self.export_status).small().color(if ok {
+                                egui::Color32::DARK_GREEN
+                            } else {
+                                egui::Color32::RED
+                            }),
+                        )
+                        .truncate(),
+                    );
                 }
                 ui.label(format!("{} strokes", self.strokes.len()));
                 ui.checkbox(&mut self.debug, "debug");
@@ -393,6 +453,20 @@ impl eframe::App for InkApp {
                         egui::RichText::new(format!("modèle : {}", self.model_desc))
                             .small()
                             .color(egui::Color32::GRAY),
+                    );
+                });
+                // Vérité terrain pour l'export InkML : pré-remplie avec le
+                // texte reconnu, corrigible à la main avant export.
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("vérité terrain :")
+                            .small()
+                            .color(egui::Color32::GRAY),
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.export_label)
+                            .desired_width(ui.available_width() - 16.0)
+                            .font(egui::TextStyle::Monospace),
                     );
                 });
                 egui::ScrollArea::vertical()
@@ -571,6 +645,42 @@ impl eframe::App for InkApp {
                 });
         }
     }
+}
+
+/// Exporte les strokes en InkML dans `dir` (créé si besoin), avec le label
+/// (vérité terrain). Retourne le chemin du fichier écrit.
+fn export_inkml_to(
+    dir: &std::path::Path,
+    strokes: &[Stroke],
+    label: &str,
+) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join(format!("ink-{}.inkml", utc_slug()));
+    std::fs::write(&path, ink::strokes_to_inkml(strokes, label))?;
+    Ok(path)
+}
+
+/// Slug UTC lisible : `2026-11-25-161530` (date civile depuis l'epoch Unix).
+fn utc_slug() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let days = (secs / 86400) as i64;
+    let rem = secs % 86400;
+    let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    // Date civile depuis le nombre de jours depuis l'epoch (H. Hinnant).
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if mo <= 2 { y + 1 } else { y };
+    format!("{y:04}-{mo:02}-{d:02}-{h:02}{m:02}{s:02}")
 }
 
 fn draw_stroke(painter: &egui::Painter, stroke: &Stroke, rect: egui::Rect) {
@@ -1215,6 +1325,55 @@ mod tests {
             (last.x - p0.x).abs() < 0.5 && (last.y - p0.y).abs() < 0.5,
             "la souris a tracé en hover pendant un touch actif: p0={p0:?} last={last:?}"
         );
+    }
+
+    #[test]
+    fn utc_slug_format_date_heure() {
+        let s = utc_slug();
+        // "2026-11-25-161530" : 17 caractères, tirets en 4, 7, 10
+        assert_eq!(s.len(), 17, "slug={s}");
+        assert!(
+            s.chars().enumerate().all(|(i, c)| i == 4 || i == 7 || i == 10 || c.is_ascii_digit()),
+            "slug={s}"
+        );
+    }
+
+    #[test]
+    fn export_inkml_ecrit_un_fichier_valide() {
+        let dir = std::path::Path::new("/tmp/ecriture-rs-test-export");
+        let _ = std::fs::remove_dir_all(dir);
+        let mut s = Stroke::new();
+        s.push(Point { x: 1.0, y: 2.0, t: 0.5, pressure: 0.7 });
+        s.push(Point { x: 3.0, y: 4.0, t: 0.6, pressure: 0.9 });
+        let path = export_inkml_to(dir, &[s], "héllo <monde>").unwrap();
+        assert!(path.exists());
+        assert!(path.file_name().unwrap().to_string_lossy().starts_with("ink-"));
+        assert!(path.to_string_lossy().ends_with(".inkml"));
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("<trace id=\"0\">1 2 0.5 0.7, 3 4 0.6 0.9</trace>"));
+        assert!(content.contains("label=\"héllo &lt;monde&gt;\""));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Écrit un InkML de démo dans /tmp/ecriture-rs-demo (validation externe
+    /// du XML, ex. avec un parser InkML).
+    /// `cargo test --bin ecriture-rs -- --ignored export_inkml_demo`
+    #[test]
+    #[ignore]
+    fn export_inkml_demo_dans_tmp() {
+        let mut s = Stroke::new();
+        for i in 0..20 {
+            s.push(Point {
+                x: i as f32 * 4.0,
+                y: 40.0 + (i as f32 * 0.3).sin() * 20.0,
+                t: i as f64 * 0.016,
+                pressure: 0.8,
+            });
+        }
+        let path =
+            export_inkml_to(std::path::Path::new("/tmp/ecriture-rs-demo"), &[s], "démo & <test>")
+                .unwrap();
+        eprintln!("inkml demo -> {}", path.display());
     }
 
     #[test]

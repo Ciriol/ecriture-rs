@@ -213,6 +213,45 @@ fn draw_line(img: &mut GrayImage, x0: f32, y0: f32, x1: f32, y1: f32, thickness:
     }
 }
 
+/// Échappement XML pour un attribut (label InkML).
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+/// Sérialise les strokes en **InkML** (W3C) : un `<trace>` par stroke avec
+/// les channels X, Y (coordonnées canvas), T (secondes) et P (pression 0..1),
+/// plus le `label` (vérité terrain) en `<annotation type="truth">`.
+/// C'est le format standard des bases de tracés online (CROHME, MathWriting,
+/// SIGN-OnDB...) : on peut ainsi constituer sa propre base d'entraînement.
+pub fn strokes_to_inkml(strokes: &[Stroke], label: &str) -> String {
+    let mut s = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+    s.push_str("<ink xmlns=\"http://www.w3.org/2003/InkML\">\n");
+    s.push_str(&format!(
+        "  <annotation type=\"truth\" label=\"{}\"/>\n",
+        xml_escape(label)
+    ));
+    s.push_str("  <traceFormat>\n");
+    s.push_str("    <channel name=\"X\" type=\"decimal\"/>\n");
+    s.push_str("    <channel name=\"Y\" type=\"decimal\"/>\n");
+    s.push_str("    <channel name=\"T\" type=\"decimal\"/>\n");
+    s.push_str("    <channel name=\"P\" type=\"decimal\"/>\n");
+    s.push_str("  </traceFormat>\n");
+    for (i, stroke) in strokes.iter().enumerate() {
+        let pts: Vec<String> = stroke
+            .points
+            .iter()
+            .map(|p| format!("{} {} {} {}", p.x, p.y, p.t, p.pressure))
+            .collect();
+        s.push_str(&format!("  <trace id=\"{i}\">{}</trace>\n", pts.join(", ")));
+    }
+    s.push_str("</ink>\n");
+    s
+}
+
 /// Nombre de features par point de trajectoire :
 /// x, y, dx, dy, dt, pression, cos(direction), sin(direction).
 pub const FEATURE_F: usize = 8;
@@ -269,6 +308,29 @@ mod tests {
         // positions normalisées dans [-1, 1]
         for v in feats.chunks(FEATURE_F) {
             assert!(v[0].abs() <= 1.0 && v[1].abs() <= 1.0);
+        }
+    }
+
+    #[test]
+    fn inkml_un_trace_par_stroke_et_label_echappe() {
+        let mut s0 = Stroke::new();
+        for i in 0..3 {
+            s0.push(Point { x: i as f32, y: 10.0, t: i as f64 * 0.016, pressure: 0.8 });
+        }
+        let mut s1 = Stroke::new();
+        s1.push(Point { x: 0.0, y: 0.0, t: 1.0, pressure: 1.0 });
+        s1.push(Point { x: 5.0, y: 5.0, t: 1.1, pressure: 0.9 });
+        let xml = strokes_to_inkml(&[s0, s1], "a<b & \"c\"");
+        assert!(xml.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>"));
+        assert!(xml.contains("<ink xmlns=\"http://www.w3.org/2003/InkML\">"));
+        // 2 strokes -> 2 traces
+        assert_eq!(xml.matches("<trace id=").count(), 2);
+        assert!(xml.contains("<trace id=\"0\">0 10 0 0.8, 1 10 0.016 0.8, 2 10 0.032 0.8</trace>"));
+        // label échappé dans l'annotation truth
+        assert!(xml.contains("<annotation type=\"truth\" label=\"a&lt;b &amp; &quot;c&quot;\"/>"));
+        // channels déclarés
+        for ch in ["X", "Y", "T", "P"] {
+            assert!(xml.contains(&format!("<channel name=\"{ch}\" type=\"decimal\"/>")));
         }
     }
 

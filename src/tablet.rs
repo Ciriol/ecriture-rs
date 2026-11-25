@@ -120,6 +120,14 @@ fn read_loop(path: String, tx: Sender<TabletEvent>, ctx: egui::Context) {
     let max_x = max_of(AbsoluteAxisCode::ABS_X);
     let max_y = max_of(AbsoluteAxisCode::ABS_Y);
     let max_p = max_of(AbsoluteAxisCode::ABS_PRESSURE);
+    // Vrai stylet (proximité BTN_TOOL_PEN) : la pression fait foi au contact
+    // même si le driver n'émet pas BTN_TOUCH. Sur un touchpad, la pression
+    // peut être > 0 en hover (doigt proche sans contact) -> faux contact,
+    // donc on s'en tient à BTN_TOUCH pour les non-stylets.
+    let is_pen = dev
+        .supported_keys()
+        .map(|k| k.contains(KeyCode::BTN_TOOL_PEN))
+        .unwrap_or(false);
 
     let mut x = 0.0f32;
     let mut y = 0.0f32;
@@ -161,12 +169,12 @@ fn read_loop(path: String, tx: Sender<TabletEvent>, ctx: egui::Context) {
                     }
                 }
                 // Fin d'un paquet atomique : c'est ici qu'on décide du contact.
-                // Contact = BTN_TOUCH enfoncé OU pression > 0 (certains drivers
-                // n'émettent pas BTN_TOUCH ; la pression est fiable au contact
-                // et à 0 en hover). La fin du stroke = plus de contact, PAS la
-                // perte de proximité (BTN_TOOL_PEN).
+                // Contact = BTN_TOUCH enfoncé, ou pression > 0 pour un stylet
+                // (certains drivers stylet n'émettent pas BTN_TOUCH). La fin du
+                // stroke = plus de contact, PAS la perte de proximité
+                // (BTN_TOOL_PEN).
                 EventType::SYNCHRONIZATION => {
-                    let contact = btn_touch || pressure > 0.0;
+                    let contact = btn_touch || (is_pen && pressure > 0.0);
                     if contact && !down {
                         down = true;
                         just_started = true;

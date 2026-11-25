@@ -49,10 +49,33 @@ struct InkApp {
     tablet_rx: Option<Receiver<TabletEvent>>,
     /// Compteur d'événements tablette reçus (pour le mode debug).
     tablet_count: u64,
+    /// Sources de modèles proposées dans le menu déroulant (haut à droite).
+    model_sources: Vec<ModelSource>,
+    /// Index dans `model_sources` du modèle sélectionné (actif ou en chargement).
+    model_index: usize,
+    /// Description du modèle actif (backend, taille d'entrée, erreur...).
+    model_desc: String,
+    /// Un chargement de modèle est en cours en arrière-plan.
+    model_loading: bool,
+    /// Réception du reconnaisseur chargé en arrière-plan (bascule à chaud).
+    model_rx: Option<Receiver<(Box<dyn Recognizer>, String)>>,
+    /// Config CLI (pour recharger un modèle avec les mêmes options).
+    cfg: Config,
+    /// Options de décodage (beam, lexique...) appliquées à chaque modèle.
+    decode_opts: DecodeOptions,
 }
 
 impl InkApp {
-    fn new(recognizer: Box<dyn Recognizer>, tablet_device: Option<String>, ctx: egui::Context) -> Self {
+    fn new(
+        recognizer: Box<dyn Recognizer>,
+        model_desc: String,
+        model_sources: Vec<ModelSource>,
+        model_index: usize,
+        cfg: Config,
+        decode_opts: DecodeOptions,
+        tablet_device: Option<String>,
+        ctx: egui::Context,
+    ) -> Self {
         // Lance la lecture evdev des périphériques stylet/touch en arrière-plan.
         // Le thread evdev réveille egui (request_repaint) à chaque événement.
         let (tx, rx) = channel();
@@ -72,6 +95,47 @@ impl InkApp {
             debug_img: None,
             tablet_rx: Some(rx),
             tablet_count: 0,
+            model_sources,
+            model_index,
+            model_desc,
+            model_loading: false,
+            model_rx: None,
+            cfg,
+            decode_opts,
+        }
+    }
+
+    /// Charge un autre modèle dans un thread d'arrière-plan (le téléchargement
+    /// HF + le parsing du checkpoint peuvent prendre plusieurs secondes) puis
+    /// bascule dessus dès réception.
+    fn start_model_load(&mut self, idx: usize, ctx: egui::Context) {
+        let src = self.model_sources[idx].clone();
+        let cfg = self.cfg.clone();
+        let opts = self.decode_opts.clone();
+        let (tx, rx) = channel();
+        self.model_rx = Some(rx);
+        self.model_loading = true;
+        self.model_desc = format!("chargement de {} ...", src.label());
+        std::thread::spawn(move || {
+            let device = candle_core::Device::Cpu;
+            let (rec, desc) = build_recognizer(&src, &cfg, opts, &device);
+            let _ = tx.send((rec, desc));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Bascule sur le modèle reçu de l'arrière-plan et re-reconnaît ce qui
+    /// est à l'écran avec le nouveau modèle.
+    fn apply_loaded_model(&mut self, rec: Box<dyn Recognizer>, desc: String) {
+        self.model_rx = None;
+        self.model_loading = false;
+        eprintln!("modèle actif : {desc}");
+        self.recognizer = rec;
+        self.model_desc = desc;
+        if self.strokes.len() > self.finalized {
+            self.recognize_window();
+        } else if !self.strokes.is_empty() {
+            self.recognize_all();
         }
     }
 
@@ -155,6 +219,15 @@ impl InkApp {
 
 impl eframe::App for InkApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Modèle chargé en arrière-plan : on bascule dessus.
+        let loaded = self.model_rx.as_ref().and_then(|rx| rx.try_recv().ok());
+        if let Some((rec, desc)) = loaded {
+            self.apply_loaded_model(rec, desc);
+        }
+        if self.model_loading {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(150));
+        }
+
         egui::Panel::top("bar").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("ecriture-rs");
@@ -170,26 +243,87 @@ impl eframe::App for InkApp {
                 }
                 ui.label(format!("{} strokes", self.strokes.len()));
                 ui.checkbox(&mut self.debug, "debug");
+                ui.separator();
+                // Sélecteur de modèle + indication du modèle actif, à droite.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let selected = if self.model_loading {
+                        "chargement…".to_string()
+                    } else {
+                        self.model_sources[self.model_index].label()
+                    };
+                    let mut new_index = self.model_index;
+                    egui::ComboBox::from_id_salt("model_choice")
+                        .width(360.0)
+                        .selected_text(selected)
+                        .show_ui(ui, |ui| {
+                            for (i, s) in self.model_sources.iter().enumerate() {
+                                ui.selectable_value(&mut new_index, i, s.label());
+                            }
+                        });
+                    if !self.model_loading && new_index != self.model_index {
+                        self.model_index = new_index;
+                        self.start_model_load(new_index, ui.ctx().clone());
+                    }
+                    let desc_color = if self.model_loading {
+                        egui::Color32::GOLD
+                    } else {
+                        egui::Color32::GRAY
+                    };
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(&self.model_desc).small().color(desc_color),
+                        )
+                        .truncate(),
+                    );
+                });
             });
         });
 
-        egui::Panel::bottom("result").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Texte reconnu :");
-                // Texte finalisé en noir, hypothèse de la fenêtre en cours en gris.
-                ui.label(egui::RichText::new(&self.result).monospace());
-                if !self.pending_text.is_empty() {
+        // Panneau du texte reconnu : redimensionnable (tirer la bordure du
+        // haut), taille par défaut generous, texte en grand (28 pt).
+        egui::Panel::bottom("result")
+            .resizable(true)
+            .default_size(200.0)
+            .min_size(120.0)
+            .max_size(500.0)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Texte reconnu").strong().size(17.0));
                     ui.label(
-                        egui::RichText::new(&self.pending_text)
-                            .monospace()
+                        egui::RichText::new(format!("modèle : {}", self.model_desc))
+                            .small()
                             .color(egui::Color32::GRAY),
                     );
+                });
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        if self.result.is_empty() && self.pending_text.is_empty() {
+                            ui.label(
+                                egui::RichText::new(
+                                    "(écrivez dans la zone centrale : le texte reconnu s'affiche ici)",
+                                )
+                                .monospace()
+                                .size(26.0)
+                                .color(egui::Color32::GRAY),
+                            );
+                        } else {
+                            // Texte finalisé en noir, hypothèse de la fenêtre en cours en gris.
+                            ui.label(egui::RichText::new(&self.result).monospace().size(28.0));
+                            if !self.pending_text.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(&self.pending_text)
+                                        .monospace()
+                                        .size(24.0)
+                                        .color(egui::Color32::GRAY),
+                                );
+                            }
+                        }
+                    });
+                if self.debug {
+                    ui.label(egui::RichText::new(&self.debug_info).monospace().small());
                 }
             });
-            if self.debug {
-                ui.label(egui::RichText::new(&self.debug_info).monospace().small());
-            }
-        });
 
         egui::CentralPanel::default().show(ui, |ui| {
             let (response, painter) =
@@ -413,6 +547,7 @@ fn draw_stroke(painter: &egui::Painter, stroke: &Stroke, rect: egui::Rect) {
 }
 
 /// Configuration (args CLI).
+#[derive(Clone)]
 struct Config {
     /// Checkpoint .pth local ; vocab.json et config.json attendus à côté.
     pth: Option<String>,
@@ -440,6 +575,231 @@ struct Config {
     nbest: usize,
     /// Poids du lexique dans le rescoring (0 = désactivé).
     lm_weight: f64,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            pth: None,
+            weights_url: None,
+            weights_dir: None,
+            repo: "Sachin-0001/crnn-iam-handwriting".to_string(),
+            input_h: None,
+            input_w: None,
+            norm: Norm::NegOneOne,
+            tablet_device: None,
+            lexicon: None,
+            beam: 16,
+            nbest: 8,
+            lm_weight: 2.0,
+        }
+    }
+}
+
+/// Source d'un modèle : dépôt Hugging Face, checkpoint local, ou URL de poids
+/// custom. Détermine le modèle au démarrage (CLI) et alimente le menu déroulant
+/// de l'UI pour basculer de modèle une fois l'application lancée.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ModelSource {
+    /// Dépôt Hugging Face, téléchargé dans le cache HF.
+    Repo(String),
+    /// Checkpoint local ; le backend est détecté depuis les fichiers à côté
+    /// (syms.txt -> PyLaIA, arch/vocab dans config.json -> doctR, sinon Sachin).
+    Local(PathBuf),
+    /// URL de base pour télécharger weights + syms.txt PyLaIA dans le cache local.
+    Url(String),
+}
+
+impl ModelSource {
+    /// Libellé affiché dans le menu déroulant de l'UI.
+    fn label(&self) -> String {
+        match self {
+            ModelSource::Repo(r) => {
+                if r.contains("pylaia-rimes") {
+                    format!("{r} · PyLaIA · français (RIMES)")
+                } else if r.contains("french") {
+                    format!("{r} · doctR · français")
+                } else if r.contains("iam") {
+                    format!("{r} · CRNN · anglais (IAM)")
+                } else {
+                    r.clone()
+                }
+            }
+            ModelSource::Local(p) => {
+                let pylaia = p
+                    .parent()
+                    .map(|d| d.join("syms.txt").exists())
+                    .unwrap_or(false);
+                if pylaia {
+                    format!("local {} · PyLaIA · français", p.display())
+                } else {
+                    format!("local {}", p.display())
+                }
+            }
+            ModelSource::Url(u) => format!("poids distants {u} · PyLaIA · français"),
+        }
+    }
+}
+
+/// Source initiale du modèle, déduite de la configuration CLI.
+fn initial_source(cfg: &Config) -> ModelSource {
+    if let Some(p) = &cfg.pth {
+        ModelSource::Local(PathBuf::from(p))
+    } else if let Some(u) = &cfg.weights_url {
+        ModelSource::Url(u.clone())
+    } else if let Some(d) = &cfg.weights_dir {
+        let d = PathBuf::from(d);
+        let w = ["weights.safetensors", "weights.ckpt", "weights.pth"]
+            .iter()
+            .map(|w| d.join(w))
+            .find(|p| p.exists())
+            .unwrap_or_else(|| d.join("weights.ckpt"));
+        ModelSource::Local(w)
+    } else if let Some((w, _syms)) = model::find_local_pylaia() {
+        eprintln!("poids PyLaIA trouvés localement : {}", w.display());
+        ModelSource::Local(w)
+    } else {
+        ModelSource::Repo(cfg.repo.clone())
+    }
+}
+
+/// Modèles proposés dans le menu de l'UI : les 3 dépôts connus, plus la source
+/// initiale (locale) en tête si elle n'en fait pas déjà partie.
+fn model_choices(initial: &ModelSource) -> Vec<ModelSource> {
+    let mut v = vec![
+        ModelSource::Repo("Sachin-0001/crnn-iam-handwriting".to_string()),
+        ModelSource::Repo("Teklia/pylaia-rimes".to_string()),
+        ModelSource::Repo("Felix92/doctr-torch-crnn-mobilenet-v3-large-french".to_string()),
+    ];
+    if !v.contains(initial) {
+        v.insert(0, initial.clone());
+    }
+    v
+}
+
+/// Résout les fichiers du modèle pour une source puis construit le
+/// reconnaisseur CRNN (backend détecté depuis les fichiers à côté).
+/// Retourne le reconnaisseur + une description affichable dans l'UI.
+fn try_build_recognizer(
+    src: &ModelSource,
+    cfg: &Config,
+    opts: DecodeOptions,
+    device: &candle_core::Device,
+) -> anyhow::Result<(CrnnRecognizer, String)> {
+    // Priorité de résolution d'une source : local > URL (téléchargée dans le
+    // cache local) > dépôt HF. Pour PyLaIA, "vocab_json"/"config_json"
+    // pointent vers syms.txt (la détection du backend se fait via syms.txt).
+    let (pth, vocab_json, config_json): (PathBuf, PathBuf, PathBuf) = match src {
+        ModelSource::Local(p) => {
+            let dir = p.parent().map(|d| d.to_path_buf()).unwrap_or_default();
+            (p.clone(), dir.join("vocab.json"), dir.join("config.json"))
+        }
+        ModelSource::Url(base) => {
+            let dir = model::cache_dir().join("pylaia-rimes");
+            let paths = model::download_weights_from_url(
+                base,
+                &dir,
+                &["weights.safetensors", "weights.ckpt", "syms.txt"],
+            )
+            .with_context(|| format!("téléchargement des poids depuis {base}"))?;
+            let syms = dir.join("syms.txt");
+            let weights = paths
+                .iter()
+                .find(|p| p.file_name().map(|n| n == "weights.safetensors").unwrap_or(false))
+                .or_else(|| {
+                    paths
+                        .iter()
+                        .find(|p| p.file_name().map(|n| n == "weights.ckpt").unwrap_or(false))
+                })
+                .cloned();
+            match weights {
+                Some(w) if syms.exists() => (w, syms.clone(), syms),
+                _ => anyhow::bail!("{base} : fichiers téléchargés incomplets (weights + syms.txt)"),
+            }
+        }
+        ModelSource::Repo(repo) => model::download_model_files(repo)
+            .with_context(|| format!("téléchargement HF du dépôt {repo}"))?,
+    };
+    let config_text = std::fs::read_to_string(&config_json).unwrap_or_default();
+    let mconfig: model::ModelConfig = serde_json::from_str(&config_text).unwrap_or_default();
+    // Backend PyLaIA si syms.txt est à côté du checkpoint (ex. Teklia/pylaia-rimes).
+    let pylaia_syms = pth
+        .parent()
+        .map(|d| d.join("syms.txt"))
+        .filter(|p| p.exists());
+    // Hauteur d'entrée : --input-h > 128 (PyLaIA) > image_height (Sachin) > input_shape[1] (doctr).
+    let input_h = cfg.input_h.unwrap_or_else(|| {
+        if pylaia_syms.is_some() {
+            128
+        } else {
+            mconfig
+                .image_height
+                .or_else(|| mconfig.input_shape.as_ref().and_then(|s| s.get(1).copied().map(|v| v as u32)))
+                .unwrap_or(32)
+        }
+    });
+    // Largeur fixe pour doctR (Sachin garde le ratio, pas de largeur fixe).
+    let input_w = cfg.input_w.unwrap_or_else(|| {
+        mconfig
+            .input_shape
+            .as_ref()
+            .and_then(|s| s.get(2).copied().map(|v| v as u32))
+            .unwrap_or(128)
+    });
+    let backend = if pylaia_syms.is_some() {
+        "pylaia"
+    } else if mconfig.is_doctr() {
+        "doctr"
+    } else {
+        "sachin"
+    };
+    let built: anyhow::Result<CrnnRecognizer> = if let Some(syms) = &pylaia_syms {
+        CrnnRecognizer::with_pylaia(&pth, syms, input_h, opts, device)
+    } else if mconfig.is_doctr() {
+        let dcfg: doctr::DoctrConfig = serde_json::from_str(&config_text)
+            .context("config.json doctR invalide")?;
+        CrnnRecognizer::with_doctr(&pth, &dcfg, 128, input_h, input_w, opts, device)
+    } else {
+        CrnnRecognizer::with_options(
+            &pth,
+            &vocab_json,
+            mconfig.num_classes.unwrap_or(80),
+            mconfig.hidden_size.unwrap_or(256),
+            input_h,
+            cfg.norm,
+            opts,
+            device,
+        )
+    };
+    // Les constructeurs (with_pylaia/with_doctr/with_options) ajoutent déjà
+    // un contexte avec le chemin du checkpoint.
+    let recognizer = built?;
+    let desc = format!(
+        "{} · backend={} · h={} w={} · norm={:?}",
+        src.label(),
+        backend,
+        input_h,
+        input_w,
+        cfg.norm
+    );
+    Ok((recognizer, desc))
+}
+
+/// Construit le reconnaisseur d'une source ; en cas d'échec, repli sur le
+/// MockRecognizer et la description contient l'erreur.
+fn build_recognizer(
+    src: &ModelSource,
+    cfg: &Config,
+    opts: DecodeOptions,
+    device: &candle_core::Device,
+) -> (Box<dyn Recognizer>, String) {
+    match try_build_recognizer(src, cfg, opts, device) {
+        Ok((r, desc)) => (Box::new(r), desc),
+        Err(e) => (
+            Box::new(MockRecognizer),
+            format!("{} · ERREUR ({e:#}) → reconnaissance simulée", src.label()),
+        ),
+    }
 }
 
 fn usage_exit() -> ! {
@@ -475,20 +835,7 @@ fn usage_exit() -> ! {
 }
 
 fn parse_args() -> Config {
-    let mut cfg = Config {
-        pth: None,
-        weights_url: None,
-        weights_dir: None,
-        repo: "Sachin-0001/crnn-iam-handwriting".to_string(),
-        input_h: None,
-        input_w: None,
-        norm: Norm::NegOneOne,
-        tablet_device: None,
-        lexicon: None,
-        beam: 16,
-        nbest: 8,
-        lm_weight: 2.0,
-    };
+    let mut cfg = Config::default();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -552,101 +899,6 @@ fn parse_args() -> Config {
 fn main() -> eframe::Result<()> {
     let cfg = parse_args();
 
-    // Résout les fichiers du modèle. Priorité :
-    //   --pth > --weights-url (téléchargé dans le cache local) > --weights-dir
-    //   > auto-local (poids à côté du binaire / CWD / cache) > --repo (HF).
-    // Pour PyLaIA, "vocab_json"/"config_json" pointent vers syms.txt (la
-    // détection du backend se fait via syms.txt à côté du checkpoint).
-    let nonexistent = || {
-        (
-            PathBuf::from("/nonexistent/model.pth"),
-            PathBuf::from("/nonexistent/vocab.json"),
-            PathBuf::from("/nonexistent/config.json"),
-        )
-    };
-    let (pth, vocab_json, config_json) = if let Some(p) = &cfg.pth {
-        let p = PathBuf::from(p);
-        let dir = p.parent().map(|d| d.to_path_buf()).unwrap_or_default();
-        (p, dir.join("vocab.json"), dir.join("config.json"))
-    } else if let Some(base) = &cfg.weights_url {
-        // Télécharge weights + syms depuis une URL custom (hors HF) dans le
-        // cache local, puis les utilise comme un --pth local.
-        let dir = model::cache_dir().join("pylaia-rimes");
-        match model::download_weights_from_url(base, &dir, &["weights.safetensors", "weights.ckpt", "syms.txt"]) {
-            Ok(paths) => {
-                let syms = dir.join("syms.txt");
-                let weights = paths
-                    .iter()
-                    .find(|p| p.file_name().map(|n| n == "weights.safetensors").unwrap_or(false))
-                    .or_else(|| paths.iter().find(|p| p.file_name().map(|n| n == "weights.ckpt").unwrap_or(false)))
-                    .cloned();
-                match weights {
-                    Some(w) if syms.exists() => (w, syms.clone(), syms),
-                    _ => {
-                        eprintln!("--weights-url {base} : fichiers retrouvés incomplets : MockRecognizer");
-                        nonexistent()
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("--weights-url {base} impossible ({e:#}) : MockRecognizer");
-                nonexistent()
-            }
-        }
-    } else if let Some(d) = &cfg.weights_dir {
-        let d = PathBuf::from(d);
-        let syms = d.join("syms.txt");
-        let weights = ["weights.safetensors", "weights.ckpt", "weights.pth"]
-            .iter()
-            .map(|w| d.join(w))
-            .find(|p| p.exists());
-        match weights {
-            Some(w) if syms.exists() => (w, syms.clone(), syms),
-            _ => {
-                eprintln!("--weights-dir {} : weights.*/syms.txt manquants : MockRecognizer", d.display());
-                nonexistent()
-            }
-        }
-    } else if let Some((w, syms)) = model::find_local_pylaia() {
-        eprintln!("poids PyLaIA trouvés localement : {}", w.display());
-        (w, syms.clone(), syms)
-    } else {
-        match model::download_model_files(&cfg.repo) {
-            Ok(paths) => paths,
-            Err(e) => {
-                eprintln!("téléchargement HF impossible ({e:#}) : MockRecognizer");
-                nonexistent()
-            }
-        }
-    };
-    let config_text = std::fs::read_to_string(&config_json).unwrap_or_default();
-    let mconfig: model::ModelConfig =
-        serde_json::from_str(&config_text).unwrap_or_default();
-    // Backend PyLaIA si syms.txt est à côté du checkpoint (ex. Teklia/pylaia-rimes).
-    let pylaia_syms = pth
-        .parent()
-        .map(|d| d.join("syms.txt"))
-        .filter(|p| p.exists());
-    // Hauteur d'entrée : --input-h > 128 (PyLaIA) > image_height (Sachin) > input_shape[1] (doctr).
-    let input_h = cfg.input_h.unwrap_or_else(|| {
-        if pylaia_syms.is_some() {
-            128
-        } else {
-            mconfig
-                .image_height
-                .or_else(|| mconfig.input_shape.as_ref().and_then(|s| s.get(1).copied().map(|v| v as u32)))
-                .unwrap_or(32)
-        }
-    });
-    // Largeur fixe pour doctR (Sachin garde le ratio, pas de largeur fixe).
-    let input_w = cfg.input_w.unwrap_or_else(|| {
-        mconfig
-            .input_shape
-            .as_ref()
-            .and_then(|s| s.get(2).copied().map(|v| v as u32))
-            .unwrap_or(128)
-    });
-
     // Lexique de langue pour le rescoring N-best : embarqué (français) par
     // défaut, fichier local avec --lexicon PATH, désactivé avec --lexicon none.
     let lexicon = match &cfg.lexicon {
@@ -665,13 +917,12 @@ fn main() -> eframe::Result<()> {
         None => "désactivé".to_string(),
     };
     eprintln!(
-        "config: pth={} repo={} input_h={} input_w={} norm={:?} backend={} tablet_device={:?} beam={} nbest={} lm_weight={} lexique={}",
-        pth.display(),
+        "config: repo={} pth={:?} input_h={:?} input_w={:?} norm={:?} tablet_device={:?} beam={} nbest={} lm_weight={} lexique={}",
         cfg.repo,
-        input_h,
-        input_w,
+        cfg.pth,
+        cfg.input_h,
+        cfg.input_w,
         cfg.norm,
-        if pylaia_syms.is_some() { "pylaia" } else if mconfig.is_doctr() { "doctr" } else { "sachin" },
         cfg.tablet_device,
         cfg.beam,
         cfg.nbest,
@@ -685,54 +936,118 @@ fn main() -> eframe::Result<()> {
         lexicon,
     };
 
-    let options = eframe::NativeOptions::default();
+    // Source du modèle (priorité : --pth > --weights-url > --weights-dir >
+    // auto-local > --repo HF) puis construction, avec repli sur le mock.
+    let src = initial_source(&cfg);
+    eprintln!("source modèle : {}", src.label());
+    let device = candle_core::Device::Cpu;
+    let (recognizer, model_desc) = build_recognizer(&src, &cfg, decode_opts.clone(), &device);
+    eprintln!("modèle actif : {model_desc}");
+    let model_sources = model_choices(&src);
+    let model_index = model_sources.iter().position(|s| s == &src).unwrap_or(0);
+
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1100.0, 800.0])
+            .with_min_inner_size([720.0, 520.0]),
+        ..Default::default()
+    };
     eframe::run_native(
         "ecriture-rs",
         options,
         Box::new(|cc| {
-            let device = candle_core::Device::Cpu;
-            // Modèle réel si présent, sinon bouchon pour tester l'UI.
-            // Le format est détecté depuis les fichiers à côté du checkpoint :
-            // syms.txt -> PyLaIA, arch/vocab dans config.json -> doctR,
-            // sinon "Sachin-0001" (vocab.json + config.json).
-            let built: anyhow::Result<CrnnRecognizer> = if let Some(syms) = &pylaia_syms {
-                CrnnRecognizer::with_pylaia(&pth, syms, input_h, decode_opts, &device)
-            } else if mconfig.is_doctr() {
-                let dcfg: doctr::DoctrConfig = serde_json::from_str(&config_text)
-                    .context("config.json doctR invalide")?;
-                CrnnRecognizer::with_doctr(
-                    &pth,
-                    &dcfg,
-                    128, // rnn_units doctR
-                    input_h,
-                    input_w,
-                    decode_opts,
-                    &device,
-                )
-            } else {
-                CrnnRecognizer::with_options(
-                    &pth,
-                    &vocab_json,
-                    mconfig.num_classes.unwrap_or(80),
-                    mconfig.hidden_size.unwrap_or(256),
-                    input_h,
-                    cfg.norm,
-                    decode_opts,
-                    &device,
-                )
-            };
-            let recognizer: Box<dyn Recognizer> = match built {
-                Ok(r) => Box::new(r),
-                Err(e) => {
-                    eprintln!("{} illisible ({e:#}) : utilisation du MockRecognizer", pth.display());
-                    Box::new(MockRecognizer)
-                }
-            };
             Ok(Box::new(InkApp::new(
                 recognizer,
+                model_desc,
+                model_sources,
+                model_index,
+                cfg.clone(),
+                decode_opts,
                 cfg.tablet_device.clone(),
                 cc.egui_ctx.clone(),
             )))
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn choix_modeles_inclut_repos_connus_et_source_initiale() {
+        let local = ModelSource::Local(PathBuf::from("/tmp/mon-modele/model.pth"));
+        let v = model_choices(&local);
+        assert_eq!(v[0], local);
+        assert!(v.contains(&ModelSource::Repo("Sachin-0001/crnn-iam-handwriting".into())));
+        assert!(v.contains(&ModelSource::Repo("Teklia/pylaia-rimes".into())));
+        assert!(v.contains(&ModelSource::Repo(
+            "Felix92/doctr-torch-crnn-mobilenet-v3-large-french".into()
+        )));
+        // Pas de doublon si la source initiale est déjà un dépôt connu.
+        let rimes = ModelSource::Repo("Teklia/pylaia-rimes".into());
+        let v2 = model_choices(&rimes);
+        assert_eq!(v2.iter().filter(|s| **s == rimes).count(), 1);
+        assert_eq!(v2.len(), 3);
+    }
+
+    #[test]
+    fn source_initiale_suit_la_config() {
+        let mut cfg = Config::default();
+        if model::find_local_pylaia().is_none() {
+            assert_eq!(
+                initial_source(&cfg),
+                ModelSource::Repo("Sachin-0001/crnn-iam-handwriting".into())
+            );
+        }
+        cfg.pth = Some("/tmp/x/model.pth".into());
+        assert_eq!(
+            initial_source(&cfg),
+            ModelSource::Local(PathBuf::from("/tmp/x/model.pth"))
+        );
+        cfg.pth = None;
+        cfg.weights_dir = Some("/tmp/mes-poids".into());
+        // weights.ckpt par défaut si aucun weights.* présent dans le dossier
+        assert_eq!(
+            initial_source(&cfg),
+            ModelSource::Local(PathBuf::from("/tmp/mes-poids/weights.ckpt"))
+        );
+    }
+
+    #[test]
+    fn build_recognizer_repli_sur_mock_si_fichier_absent() {
+        let cfg = Config::default();
+        let src = ModelSource::Local(PathBuf::from("/nonexistent/model.pth"));
+        let (mut rec, desc) =
+            build_recognizer(&src, &cfg, DecodeOptions::default(), &candle_core::Device::Cpu);
+        assert!(desc.contains("ERREUR"), "desc={desc}");
+        assert_eq!(rec.recognize_strokes(&[]).unwrap(), "[reconnaissance simulée]");
+    }
+
+    /// Test réel (à lancer explicitement) : construit le reconnaisseur depuis
+    /// le modèle PyLaIA local si présent.
+    /// `cargo test --release --bin ecriture-rs -- --ignored --nocapture modele_local_pylaia`
+    #[test]
+    #[ignore]
+    fn modele_local_pylaia_se_charge() {
+        let home = std::env::var("HOME").unwrap();
+        let ckpt = PathBuf::from(&home).join("modeles/pylaia-rimes/weights.ckpt");
+        if !ckpt.exists() {
+            eprintln!("skip: {} absent", ckpt.display());
+            return;
+        }
+        let cfg = Config::default();
+        let src = ModelSource::Local(ckpt);
+        let (mut r, desc) = try_build_recognizer(
+            &src,
+            &cfg,
+            DecodeOptions::default(),
+            &candle_core::Device::Cpu,
+        )
+        .unwrap();
+        assert!(desc.contains("backend=pylaia"), "desc={desc}");
+        assert!(desc.contains("h=128"), "desc={desc}");
+        let s = Stroke::new();
+        assert!(r.recognize_strokes(&[s]).is_ok());
+    }
 }

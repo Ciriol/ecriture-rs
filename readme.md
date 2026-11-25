@@ -25,7 +25,11 @@ beam search CTC N-best (src/recognizer.rs) + rescoring par lexique de langue
 
 - Reconnaissance **incrémentale** : 0,6 s après la fin d'un tracé, seuls les nouveaux strokes sont reconnus et ajoutés au texte.
 - **Stylet Linux** : lu directement via evdev (`src/tablet.rs`) quand winit ne remonte rien ; contact détecté par `BTN_TOUCH`/pression, coordonnées normalisées depuis les bornes du périphérique, pression `ABS_PRESSURE` conservée dans chaque point.
-- **Modèle** : par défaut `Sachin-0001/crnn-iam-handwriting` (CRNN-CTC entraîné sur IAM), téléchargé automatiquement depuis Hugging Face (`hf-hub`) et lu en pur Rust (`pthrs`). Inférence CPU via candle.
+- **Modèles** : 3 backends CRNN-CTC, tous chargés en pur Rust depuis un checkpoint torch (`pthrs`), inférence CPU via candle :
+  - `Sachin-0001/crnn-iam-handwriting` (défaut, anglais, IAM) : `model.pth` + `vocab.json` + `config.json`
+  - **PyLaIA `Teklia/pylaia-rimes` (français, CER ~4.5% sur RIMES)** : `weights.ckpt` + `syms.txt` — lancer avec `--pth ~/modeles/pylaia-rimes/weights.ckpt` (détection auto via `syms.txt`)
+  - doctR `crnn_mobilenet_v3_large` : `pytorch_model.bin` + `config.json` (détection auto via `arch`/`vocab` dans le config)
+  Les 3 backends sont validés bit-à-bit contre PyTorch (tests `parite_*` : logits max|diff| < 6e-5).
 
 ## Prérequis
 
@@ -45,7 +49,7 @@ Le modèle est téléchargé au premier lancement (cache Hugging Face). Sans mod
 | Option CLI | Défaut | Rôle |
 |---|---|---|
 | `--repo owner/name` | `Sachin-0001/crnn-iam-handwriting` | dépôt Hugging Face du modèle (model.pth, vocab.json, config.json) |
-| `--pth PATH` | — | checkpoint `.pth` local (vocab.json et config.json attendus à côté) |
+| `--pth PATH` | — | checkpoint local ; le format est détecté depuis les fichiers à côté : `syms.txt` → PyLaIA (ex. `--pth ~/modeles/pylaia-rimes/weights.ckpt`), `arch`/`vocab` dans config.json → doctR, sinon Sachin (`model.pth` + `vocab.json` + `config.json`) |
 | `--input-h N` | `image_height` du config.json (32) | hauteur de redimensionnement de l'image d'entrée. Toute valeur ≥ 32 fonctionne avec le CRNN (pool vertical adaptatif en fin de CNN) ; 32 = défaut du modèle IAM |
 | `--norm 01\|neg1` | `neg1` | normalisation des pixels : `01` = 0..1 (blanc=1), `neg1` = -1..1 |
 | `--tablet-device /dev/input/eventN` | auto-détection | périphérique tablette forcé (ou env `ECRITURE_TABLET_DEVICE`) |
@@ -56,9 +60,14 @@ Le modèle est téléchargé au premier lancement (cache Hugging Face). Sans mod
 
 Dans l'UI : tracer dans la zone centrale, **Reconnaître** (tout relire), **Effacer**, case **debug** (événements d'entrée reçus).
 
-Exemple avec un modèle local :
+Exemples avec un modèle local :
 
 ```bash
+# modèle français PyLaIA (RIMES) : télécharger weights.ckpt + syms.txt depuis
+# https://huggingface.co/Teklia/pylaia-rimes dans ~/modeles/pylaia-rimes/
+cargo run --release -- --pth ~/modeles/pylaia-rimes/weights.ckpt
+
+# modèle IAM Sachin local :
 cargo run --release -- --pth ~/modeles/crnn/model.pth --input-h 32 --norm neg1 --tablet-device /dev/input/event9
 ```
 
@@ -74,8 +83,13 @@ ecriture-rs/
 │   ├── ink.rs          Point/Stroke, resample, lissage, rendu image grayscale avec marges
 │   ├── lexicon.rs      lexique de langue + couverture lexicale d'une hypothèse
 │   ├── tablet.rs       lecture evdev du stylet (thread + channel + réveil egui)
-│   ├── model.rs        CRNN candle-nn, chargement .pth (pthrs), téléchargement HF (hf-hub)
-│   └── recognizer.rs   trait Recognizer, CrnnRecognizer, beam CTC N-best + rescoring lexique
+│   ├── model.rs        CRNN "Sachin" candle-nn, chargement .pth (pthrs), téléchargement HF
+│   ├── doctr.rs        CRNN doctR mobilenet_v3_large (pytorch_model.bin)
+│   ├── pylaia.rs       CRNN PyLaIA LaiaCRNN (weights.ckpt + syms.txt, ex. RIMES FR)
+│   └── recognizer.rs   trait Recognizer, 3 backends, beam CTC N-best + rescoring lexique
+├── examples/
+│   ├── dump_pth.rs     liste les tenseurs d'un checkpoint torch
+│   └── export_pth.rs   exporte un checkpoint en .f32 bruts (debug cross-framework)
 └── LICENSE.md
 ```
 
@@ -93,9 +107,14 @@ avec marges (la bounding box occupe 75 % de la hauteur, largeur min 2×hauteur),
 trait ~hauteur/10, lissage du bruit capteur, puis resize **bilinéaire** à
 `--input-h` (32) et normalisation `p/127.5 - 1` (équivalent `--norm neg1`).
 Décodage CTC par **beam search N-best** (`--beam`, `--nbest`) puis **rescoring par
-lexique** (`--lm-weight`, lexique français embarqué par défaut). Sur 10 échantillons
-IAM réels (lexique anglais de calibration) : CER glouton 0.1025 → beam+lexique
-**0.0968** (le modèle annonce 0.126 sur tout son test set).
+lexique** (`--lm-weight`, lexique français embarqué par défaut). Benchmarks réels
+(tests `#[ignore]`) :
+- IAM (Sachin, 10 lignes, lexique anglais de calibration) : CER glouton 0.1025 →
+  beam+lexique **0.0968** (modèle annoncé à 0.126 sur tout son test)
+- RIMES (PyLaIA FR, 12 lignes test) : CER beam ≈ **0.29** sur ces 12 premières
+  lignes (le modèle annonce 4.5 % sur les 778 lignes du test)
+- Parité Rust vs PyTorch validée sur les 3 backends (logits max|diff| < 6e-5) :
+  `cargo test --release -- --ignored parite`
 
 ## Roadmap
 

@@ -46,12 +46,18 @@ pub trait Recognizer {
 }
 
 /// Décodage glouton CTC : argmax par pas de temps, dédoublonnage,
-/// suppression du blank (index 0).
-pub fn ctc_greedy_decode(logits: &[f32], width: usize, height: usize, charset: &[char]) -> String {
+/// suppression du blank (`blank`, index 0 pour le CRNN IAM, dernier pour doctR).
+pub fn ctc_greedy_decode(
+    logits: &[f32],
+    width: usize,
+    height: usize,
+    charset: &[char],
+    blank: usize,
+) -> String {
     let mut out = String::new();
-    let mut prev = 0usize;
+    let mut prev = blank;
     for t in 0..width {
-        let mut best = 0usize;
+        let mut best = blank;
         let mut best_v = f32::MIN;
         for c in 0..height {
             let v = logits[t * height + c];
@@ -60,7 +66,7 @@ pub fn ctc_greedy_decode(logits: &[f32], width: usize, height: usize, charset: &
                 best = c;
             }
         }
-        if best != 0 && best != prev {
+        if best != blank && best != prev {
             if let Some(&ch) = charset.get(best) {
                 out.push(ch);
             }
@@ -81,6 +87,7 @@ pub fn ctc_beam_decode_nbest(
     charset: &[char],
     beam_size: usize,
     nbest: usize,
+    blank: usize,
 ) -> Vec<(String, f64)> {
     use std::collections::HashMap;
     // beam: préfixe (classes) -> (proba se terminant par blank, proba non-blank)
@@ -96,7 +103,7 @@ pub fn ctc_beam_decode_nbest(
                     continue; // classe quasi impossible à ce pas de temps
                 }
                 let p = lp.exp();
-                if c == 0 {
+                if c == blank {
                     let e = next.entry(prefix.clone()).or_insert((0.0, 0.0));
                     e.0 += (pb + pnb) * p;
                 } else if prefix.last() == Some(&c) {
@@ -148,8 +155,9 @@ pub fn ctc_beam_decode(
     height: usize,
     charset: &[char],
     beam_size: usize,
+    blank: usize,
 ) -> String {
-    ctc_beam_decode_nbest(logits, width, height, charset, beam_size, 1)
+    ctc_beam_decode_nbest(logits, width, height, charset, beam_size, 1, blank)
         .into_iter()
         .next()
         .map(|(s, _)| s)
@@ -198,11 +206,32 @@ impl Default for DecodeOptions {
     }
 }
 
-/// Reconnaissance via le CRNN chargé depuis un .pth (CNN-BiLSTM-CTC).
-/// Entrée : image grayscale redimensionnée à hauteur `input_h`, normalisée
-/// selon `norm`, tenseur [1, 1, H, W]. Sortie du modèle : logits [1, T, C].
+/// Backend de modèle supporté.
+pub enum Backend {
+    /// CRNN "Sachin-0001" (CNN 7 convs + BiLSTM 256) : entrée [1, 1, H, W],
+    /// hauteur fixe en gardant le ratio, norm 0..1 ou -1..1, blank = index 0.
+    Sachin(Crnn),
+    /// CRNN doctR mobilenet_v3_large : entrée [1, 3, H, W] à taille FIXE
+    /// (resize sans garder le ratio), normalisation (x - mean) / std,
+    /// blank = dernier index.
+    Doctr {
+        model: crate::doctr::DoctrCrnn,
+        mean: [f32; 3],
+        std: [f32; 3],
+        input_w: u32,
+    },
+    /// PyLaIA LaiaCRNN (ex. Teklia/pylaia-rimes) : entrée [1, 1, 128, W],
+    /// hauteur fixe 128 en gardant le ratio, image INVERSÉE puis /255
+    /// (fond 0, encre 1), blank = index 0 (`<ctc>`).
+    Pylaia(crate::pylaia::PylaiaCrnn),
+}
+
+/// Reconnaissance via un CRNN chargé depuis un checkpoint torch.
+/// Entrée : image grayscale prétraitée selon le backend. Sortie : logits [1, T, C].
 pub struct CrnnRecognizer {
-    model: Crnn,
+    backend: Backend,
+    /// Index de la classe blank CTC (0 pour Sachin, num_classes-1 pour doctR).
+    blank_id: usize,
     charset: Vec<char>,
     device: Device,
     input_h: u32,
@@ -213,6 +242,7 @@ pub struct CrnnRecognizer {
 }
 
 impl CrnnRecognizer {
+    /// Modèle "Sachin-0001" (IAM) depuis un .pth + vocab.json, options par défaut.
     pub fn new(
         pth_path: &Path,
         vocab_path: &Path,
@@ -234,6 +264,7 @@ impl CrnnRecognizer {
         )
     }
 
+    /// Modèle "Sachin-0001" avec options de décodage explicites.
     pub fn with_options(
         pth_path: &Path,
         vocab_path: &Path,
@@ -255,7 +286,8 @@ impl CrnnRecognizer {
             );
         }
         Ok(Self {
-            model,
+            backend: Backend::Sachin(model),
+            blank_id: 0,
             charset,
             device: device.clone(),
             input_h,
@@ -265,11 +297,73 @@ impl CrnnRecognizer {
         })
     }
 
+    /// Modèle doctR (ex. crnn_mobilenet_v3_large français) depuis un
+    /// pytorch_model.bin + config.json doctR.
+    pub fn with_doctr(
+        pth_path: &Path,
+        cfg: &crate::doctr::DoctrConfig,
+        hidden_size: usize,
+        input_h: u32,
+        input_w: u32,
+        opts: DecodeOptions,
+        device: &Device,
+    ) -> Result<Self> {
+        let num_classes = cfg.vocab.chars().count() + 1; // + blank (dernier)
+        let model = crate::doctr::DoctrCrnn::load(pth_path, num_classes, hidden_size, device)
+            .with_context(|| format!("chargement du modèle doctR {}", pth_path.display()))?;
+        let (charset, blank_id) = crate::doctr::doctr_charset(&cfg.vocab, num_classes);
+        let mean = [
+            cfg.mean.first().copied().unwrap_or(0.5),
+            cfg.mean.get(1).copied().unwrap_or(0.5),
+            cfg.mean.get(2).copied().unwrap_or(0.5),
+        ];
+        let std = [
+            cfg.std.first().copied().unwrap_or(1.0),
+            cfg.std.get(1).copied().unwrap_or(1.0),
+            cfg.std.get(2).copied().unwrap_or(1.0),
+        ];
+        Ok(Self {
+            backend: Backend::Doctr { model, mean, std, input_w },
+            blank_id,
+            charset,
+            device: device.clone(),
+            input_h,
+            norm: Norm::NegOneOne, // inutilisé pour doctR
+            opts,
+            last_input: None,
+        })
+    }
+
+    /// Modèle PyLaIA (ex. Teklia/pylaia-rimes) depuis un weights.ckpt +
+    /// syms.txt. Hauteur d'entrée fixe (128 par défaut).
+    pub fn with_pylaia(
+        pth_path: &Path,
+        syms_path: &Path,
+        input_h: u32,
+        opts: DecodeOptions,
+        device: &Device,
+    ) -> Result<Self> {
+        let (charset, blank_id) = crate::pylaia::pylaia_charset(syms_path)?;
+        let num_classes = charset.len();
+        let model = crate::pylaia::PylaiaCrnn::load(pth_path, num_classes, 256, 3, device)
+            .with_context(|| format!("chargement du modèle PyLaIA {}", pth_path.display()))?;
+        Ok(Self {
+            backend: Backend::Pylaia(model),
+            blank_id,
+            charset,
+            device: device.clone(),
+            input_h,
+            norm: Norm::ZeroOne, // inutilisé pour pylaia
+            opts,
+            last_input: None,
+        })
+    }
+
     /// Décodage d'une séquence de log-probabilités [T, C] : beam CTC N-best
     /// puis rescoring par le lexique si activé.
     fn decode(&self, flat: &[f32], t: usize, c: usize) -> String {
         if self.opts.beam_size <= 1 {
-            return ctc_greedy_decode(flat, t, c, &self.charset);
+            return ctc_greedy_decode(flat, t, c, &self.charset, self.blank_id);
         }
         let nbest = ctc_beam_decode_nbest(
             flat,
@@ -278,6 +372,7 @@ impl CrnnRecognizer {
             &self.charset,
             self.opts.beam_size,
             self.opts.nbest,
+            self.blank_id,
         );
         match &self.opts.lexicon {
             Some(lex) if self.opts.lm_weight > 0.0 && nbest.len() > 1 => {
@@ -288,36 +383,90 @@ impl CrnnRecognizer {
     }
 
     fn image_to_tensor(&mut self, img: &GrayImage) -> Result<Tensor> {
-        // Redimensionne à hauteur fixe en gardant les proportions, comme le
-        // prétraitement officiel du modèle (PIL BILINEAR + round). Le filtre
-        // bilinéaire (Triangle) colle au handler ; Lanczos3 créait des artefacts
-        // de ringing sur les bords nets noir/blanc du rendu de strokes.
-        let ratio = self.input_h as f32 / img.height() as f32;
-        let w = ((img.width() as f32 * ratio).round() as u32).max(1);
-        let resized = image::imageops::resize(
-            img,
-            w,
-            self.input_h,
-            image::imageops::FilterType::Triangle,
-        );
-        let mut data = vec![0f32; (w * self.input_h) as usize];
-        for (i, p) in resized.pixels().enumerate() {
-            data[i] = self.norm.apply(p.0[0] as f32 / 255.0);
+        match &self.backend {
+            Backend::Sachin(_) => {
+                // Redimensionne à hauteur fixe en gardant les proportions, comme
+                // le prétraitement officiel du modèle (PIL BILINEAR + round).
+                // Filtre bilinéaire (Triangle) : Lanczos3 créait des artefacts
+                // de ringing sur les bords nets noir/blanc du rendu de strokes.
+                let ratio = self.input_h as f32 / img.height() as f32;
+                let w = ((img.width() as f32 * ratio).round() as u32).max(1);
+                let resized = image::imageops::resize(
+                    img,
+                    w,
+                    self.input_h,
+                    image::imageops::FilterType::Triangle,
+                );
+                let mut data = vec![0f32; (w * self.input_h) as usize];
+                for (i, p) in resized.pixels().enumerate() {
+                    data[i] = self.norm.apply(p.0[0] as f32 / 255.0);
+                }
+                self.last_input = Some(resized.clone());
+                Tensor::from_vec(
+                    data,
+                    (1, 1, self.input_h as usize, w as usize),
+                    &self.device,
+                )
+                .context("construction du tenseur d'entrée")
+            }
+            Backend::Doctr { mean, std, input_w, .. } => {
+                // doctR : resize à taille FIXE (H, W) sans garder le ratio
+                // (c'est ainsi que le modèle a été entraîné), 3 canaux
+                // (gris répliqué), normalisation (x/255 - mean) / std.
+                let (w, h) = (*input_w, self.input_h);
+                let resized = image::imageops::resize(
+                    img,
+                    w,
+                    h,
+                    image::imageops::FilterType::Triangle, // torchvision Resize = BILINEAR
+                );
+                let hw = (w * h) as usize;
+                let mut data = vec![0f32; 3 * hw];
+                for (i, p) in resized.pixels().enumerate() {
+                    let v = p.0[0] as f32 / 255.0;
+                    for c in 0..3 {
+                        data[c * hw + i] = (v - mean[c]) / std[c];
+                    }
+                }
+                self.last_input = Some(resized.clone());
+                Tensor::from_vec(data, (1, 3, h as usize, w as usize), &self.device)
+                    .context("construction du tenseur d'entrée")
+            }
+            Backend::Pylaia(_) => {
+                // PyLaIA : resize hauteur fixe en gardant le ratio (LANCZOS),
+                // image INVERSÉE (fond 0, encre 1) puis /255 -> [0, 1].
+                let ratio = self.input_h as f32 / img.height() as f32;
+                let w = ((img.width() as f32 * ratio).round() as u32).max(1);
+                let resized = image::imageops::resize(
+                    img,
+                    w,
+                    self.input_h,
+                    image::imageops::FilterType::Lanczos3,
+                );
+                let mut data = vec![0f32; (w * self.input_h) as usize];
+                for (i, p) in resized.pixels().enumerate() {
+                    data[i] = (255 - p.0[0]) as f32 / 255.0;
+                }
+                self.last_input = Some(resized.clone());
+                Tensor::from_vec(
+                    data,
+                    (1, 1, self.input_h as usize, w as usize),
+                    &self.device,
+                )
+                .context("construction du tenseur d'entrée")
+            }
         }
-        self.last_input = Some(resized);
-        Tensor::from_vec(
-            data,
-            (1, 1, self.input_h as usize, w as usize),
-            &self.device,
-        )
-        .context("construction du tenseur d'entrée")
     }
 }
 
 impl Recognizer for CrnnRecognizer {
     fn recognize(&mut self, img: &GrayImage) -> Result<String> {
         let input = self.image_to_tensor(img)?;
-        let logits = self.model.forward(&input).context("inférence CRNN")?;
+        let logits = match &self.backend {
+            Backend::Sachin(m) => m.forward(&input).context("inférence CRNN")?,
+            Backend::Doctr { model, .. } => model.forward(&input).context("inférence doctR")?,
+            Backend::Pylaia(m) => m.forward(&input).context("inférence PyLaIA")?,
+        };
         // logits [1, T, C]
         let dims = logits.dims();
         let (t, c) = (dims[1], dims[2]);
@@ -370,19 +519,19 @@ mod tests {
         let charset: Vec<char> = vec!['\u{0}', 'a', 'b'];
         // [a, a] -> "a" (répétition sans blank entre = 1 seul caractère en CTC)
         let l = logits_from_path(&[1, 1, 1], 3);
-        assert_eq!(ctc_greedy_decode(&l, 3, 3, &charset), "a");
+        assert_eq!(ctc_greedy_decode(&l, 3, 3, &charset, 0), "a");
         // [a, blank, a] -> "aa" (le blank sépare les deux 'a')
         let l = logits_from_path(&[1, 0, 1], 3);
-        assert_eq!(ctc_greedy_decode(&l, 3, 3, &charset), "aa");
+        assert_eq!(ctc_greedy_decode(&l, 3, 3, &charset, 0), "aa");
         // [a, b, a] -> "aba"
         let l = logits_from_path(&[1, 2, 1], 3);
-        assert_eq!(ctc_greedy_decode(&l, 3, 3, &charset), "aba");
+        assert_eq!(ctc_greedy_decode(&l, 3, 3, &charset, 0), "aba");
         // tout blank -> ""
         let l = logits_from_path(&[0, 0, 0], 3);
-        assert_eq!(ctc_greedy_decode(&l, 3, 3, &charset), "");
+        assert_eq!(ctc_greedy_decode(&l, 3, 3, &charset, 0), "");
         // [b, blank, blank, a] -> "ba"
         let l = logits_from_path(&[2, 0, 0, 1], 3);
-        assert_eq!(ctc_greedy_decode(&l, 4, 3, &charset), "ba");
+        assert_eq!(ctc_greedy_decode(&l, 4, 3, &charset, 0), "ba");
     }
 
     #[test]
@@ -396,7 +545,7 @@ mod tests {
             (vec![0, 0, 0], ""),
         ] {
             let l = logits_from_path(&path, 3);
-            assert_eq!(ctc_beam_decode(&l, path.len(), 3, &charset, 8), attendu);
+            assert_eq!(ctc_beam_decode(&l, path.len(), 3, &charset, 8, 0), attendu);
         }
     }
 
@@ -414,7 +563,7 @@ mod tests {
         l[1 * c + 2] = 0.0;
         // t2: blank
         l[2 * c + 0] = 0.0;
-        let s = ctc_beam_decode(&l, t, c, &charset, 8);
+        let s = ctc_beam_decode(&l, t, c, &charset, 8, 0);
         assert_eq!(s, "ab");
     }
 
@@ -488,9 +637,9 @@ mod tests {
             CrnnRecognizer::with_options(
                 &pth,
                 &vocab,
-                mconfig.num_classes,
-                mconfig.hidden_size,
-                mconfig.image_height,
+                mconfig.num_classes.unwrap_or(80),
+                mconfig.hidden_size.unwrap_or(256),
+                mconfig.image_height.unwrap_or(32),
                 Norm::NegOneOne,
                 opts,
                 &device,
@@ -566,6 +715,71 @@ mod tests {
         println!();
     }
 
+    /// Bench FR réel (à lancer explicitement) : modèle PyLaIA français
+    /// (~/modeles/pylaia-rimes/weights.ckpt, Teklia/pylaia-rimes) sur des
+    /// lignes RIMES-2011 extraites dans /tmp/rimes_samples.
+    /// Compare beam pur vs beam+lexique FR. Le modèle annonce CER ~4.5%.
+    /// `cargo test --release -- --ignored --nocapture bench_rimes`
+    #[test]
+    #[ignore]
+    fn bench_rimes_francais() {
+        let dir = std::path::Path::new("/tmp/rimes_samples");
+        let model_dir = std::path::Path::new("/home/lbonnier/modeles/pylaia-rimes");
+        if !dir.join("meta.json").exists() || !model_dir.join("weights.ckpt").exists() {
+            eprintln!("skip: /tmp/rimes_samples ou ~/modeles/pylaia-rimes absent");
+            return;
+        }
+        let device = Device::Cpu;
+        let mk = |lm_weight: f64| {
+            CrnnRecognizer::with_pylaia(
+                &model_dir.join("weights.ckpt"),
+                &model_dir.join("syms.txt"),
+                128,
+                DecodeOptions {
+                    beam_size: 16,
+                    nbest: 8,
+                    lm_weight,
+                    lexicon: Some(crate::lexicon::Lexicon::embedded_fr()),
+                },
+                &device,
+            )
+            .unwrap()
+        };
+        let mut rec_beam = mk(0.0);
+        let mut rec_lm = mk(2.0);
+        let meta: Vec<serde_json::Value> =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("meta.json")).unwrap())
+                .unwrap();
+        let mut cer_b = 0.0f64;
+        let mut cer_lm = 0.0f64;
+        let mut n = 0usize;
+        for m in &meta {
+            let file = m["file"].as_str().unwrap();
+            let label = m["label"].as_str().unwrap();
+            let img = image::open(dir.join(file)).unwrap().to_luma8();
+            let pred_b = rec_beam.recognize(&img).unwrap();
+            let pred_lm = rec_lm.recognize(&img).unwrap();
+            let lc: Vec<char> = label.chars().collect();
+            let cer = |p: &str| {
+                let pc: Vec<char> = p.chars().collect();
+                levenshtein(&pc, &lc) as f64 / lc.len().max(1) as f64
+            };
+            println!(
+                "{file} beam={:.3} beam+lm={:.3}\n  label: {label}\n  beam : {pred_b}\n  lm   : {pred_lm}",
+                cer(&pred_b),
+                cer(&pred_lm),
+            );
+            cer_b += cer(&pred_b);
+            cer_lm += cer(&pred_lm);
+            n += 1;
+        }
+        println!(
+            "CER moyen RIMES sur {n} lignes: beam={:.4} beam+lexiqueFR={:.4}",
+            cer_b / n as f64,
+            cer_lm / n as f64
+        );
+    }
+
     /// Demo visuelle (à lancer explicitement) : reconnaît des strokes
     /// synthétiques "IN" et sauve l'image exacte envoyée au modèle.
     /// `cargo test --release -- --ignored --nocapture dump_input_modele`
@@ -600,9 +814,9 @@ mod tests {
         let mut rec = CrnnRecognizer::new(
             &pth,
             &vocab,
-            mconfig.num_classes,
-            mconfig.hidden_size,
-            mconfig.image_height,
+            mconfig.num_classes.unwrap_or(80),
+            mconfig.hidden_size.unwrap_or(256),
+            mconfig.image_height.unwrap_or(32),
             Norm::NegOneOne,
             &device,
         )

@@ -17,12 +17,35 @@ use candle_nn::{
 };
 use serde::Deserialize;
 
-/// config.json du dépôt HF.
-#[derive(Deserialize)]
+/// config.json du modèle. Format "Sachin-0001" (IAM) : num_classes,
+/// hidden_size, image_height + vocab.json à côté. Format doctR (ex. modèle
+/// français Felix92/...-french) : arch + vocab (string) + mean/std/input_shape,
+/// poids dans pytorch_model.bin, blank CTC = dernier index.
+#[derive(Deserialize, Default, Clone, Debug)]
 pub struct ModelConfig {
-    pub num_classes: usize,
-    pub hidden_size: usize,
-    pub image_height: u32,
+    #[serde(default)]
+    pub num_classes: Option<usize>,
+    #[serde(default)]
+    pub hidden_size: Option<usize>,
+    #[serde(default)]
+    pub image_height: Option<u32>,
+    #[serde(default)]
+    pub arch: Option<String>,
+    #[serde(default)]
+    pub vocab: Option<String>,
+    #[serde(default)]
+    pub mean: Option<Vec<f32>>,
+    #[serde(default)]
+    pub std: Option<Vec<f32>>,
+    #[serde(default)]
+    pub input_shape: Option<Vec<usize>>,
+}
+
+impl ModelConfig {
+    /// true si c'est un modèle doctR (champ `arch` ou `vocab` présent).
+    pub fn is_doctr(&self) -> bool {
+        self.arch.is_some() || self.vocab.is_some()
+    }
 }
 
 /// vocab.json du dépôt HF.
@@ -53,19 +76,41 @@ pub fn load_charset(vocab_path: &Path) -> Result<Vec<char>> {
     Ok(chars)
 }
 
-/// Télécharge model.pth, vocab.json et config.json d'un dépôt HF.
+/// Télécharge les fichiers d'un dépôt HF modèle. Deux formats :
+/// - "Sachin-0001" (IAM) : model.pth + vocab.json + config.json
+/// - doctR (ex. modèle français) : pytorch_model.bin + config.json (le vocab
+///   est dans le config.json ; on renvoie config.json comme "vocab").
 pub fn download_model_files(repo: &str) -> Result<(PathBuf, PathBuf, PathBuf)> {
     let client = hf_hub::HFClientSync::new().context("client Hugging Face")?;
     let (owner, name) = hf_hub::split_id(repo);
     let repo_hf = client.model(owner, name);
-    let pth = repo_hf
+    let config = repo_hf
         .download_file()
-        .filename("model.pth")
+        .filename("config.json")
         .send()
-        .with_context(|| format!("téléchargement model.pth depuis {repo}"))?;
-    let vocab = repo_hf.download_file().filename("vocab.json").send()?;
-    let config = repo_hf.download_file().filename("config.json").send()?;
-    Ok((pth, vocab, config))
+        .with_context(|| format!("téléchargement config.json depuis {repo}"))?;
+    let cfg_text = std::fs::read_to_string(&config).unwrap_or_default();
+    let cfg: ModelConfig = serde_json::from_str(&cfg_text).unwrap_or_default();
+    if cfg.is_doctr() {
+        let pth = repo_hf
+            .download_file()
+            .filename("pytorch_model.bin")
+            .send()
+            .with_context(|| format!("téléchargement pytorch_model.bin depuis {repo}"))?;
+        Ok((pth, config.clone(), config))
+    } else {
+        let pth = repo_hf
+            .download_file()
+            .filename("model.pth")
+            .send()
+            .with_context(|| format!("téléchargement model.pth depuis {repo}"))?;
+        let vocab = repo_hf
+            .download_file()
+            .filename("vocab.json")
+            .send()
+            .with_context(|| format!("téléchargement vocab.json depuis {repo}"))?;
+        Ok((pth, vocab, config))
+    }
 }
 
 /// CRNN : CNN (7 couches) -> BiLSTM 2 couches -> Linear -> log_softmax.
@@ -223,21 +268,21 @@ mod tests {
         let mconfig: ModelConfig =
             serde_json::from_str(&std::fs::read_to_string(config_json).unwrap()).unwrap();
         let charset = load_charset(&vocab).unwrap();
-        assert_eq!(charset.len(), mconfig.num_classes);
-        let model = Crnn::load(&pth, mconfig.num_classes, mconfig.hidden_size, &device).unwrap();
+        assert_eq!(charset.len(), mconfig.num_classes.unwrap_or(80));
+        let model = Crnn::load(&pth, mconfig.num_classes.unwrap_or(80), mconfig.hidden_size.unwrap_or(256), &device).unwrap();
         // image blanche 32x128 normalisée [-1, 1] -> 1.0
-        let img = Tensor::ones((1, 1, mconfig.image_height as usize, 128), DType::F32, &device)
+        let img = Tensor::ones((1, 1, mconfig.image_height.unwrap_or(32) as usize, 128), DType::F32, &device)
             .unwrap();
         let logits = model.forward(&img).unwrap();
         let dims = logits.dims();
         assert_eq!(dims[0], 1);
-        assert_eq!(dims[2], mconfig.num_classes);
+        assert_eq!(dims[2], mconfig.num_classes.unwrap_or(80));
         println!("logits shape: {:?}", dims);
 
         // --input-h 48 : le pool vertical adaptatif doit accepter H=48
         let img48 = Tensor::ones((1, 1, 48, 128), DType::F32, &device).unwrap();
         let logits48 = model.forward(&img48).unwrap();
-        assert_eq!(logits48.dims()[2], mconfig.num_classes);
+        assert_eq!(logits48.dims()[2], mconfig.num_classes.unwrap_or(80));
         println!("logits shape H=48: {:?}", logits48.dims());
     }
 }

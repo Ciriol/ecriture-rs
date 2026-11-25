@@ -1,14 +1,17 @@
 //! UI egui : canvas d'écriture + bouton de reconnaissance.
 
+mod doctr;
 mod ink;
 mod lexicon;
 mod model;
+mod pylaia;
 mod recognizer;
 mod tablet;
 
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver};
 
+use anyhow::Context as _;
 use eframe::egui;
 use ink::{Point, Stroke};
 use recognizer::{CrnnRecognizer, DecodeOptions, MockRecognizer, Norm, Recognizer};
@@ -415,8 +418,11 @@ struct Config {
     pth: Option<String>,
     /// Dépôt Hugging Face téléchargé si --pth absent (modèle par défaut).
     repo: String,
-    /// Hauteur d'entrée du modèle (défaut: image_height du config.json).
+    /// Hauteur d'entrée du modèle (défaut: image_height du config.json, ou
+    /// input_shape[1] pour un modèle doctR).
     input_h: Option<u32>,
+    /// Largeur d'entrée fixe pour un modèle doctR (défaut: input_shape[2] = 128).
+    input_w: Option<u32>,
     norm: Norm,
     /// Périphérique tablette forcé (ex. /dev/input/event9).
     tablet_device: Option<String>,
@@ -433,13 +439,20 @@ struct Config {
 
 fn usage_exit() -> ! {
     eprintln!(
-        "usage: ecriture-rs [--pth model.pth] [--repo owner/name] [--input-h N] [--norm 01|neg1]\n\
-         \x20         [--tablet-device /dev/input/eventN] [--lexicon PATH|none] [--beam N]\n\
-         \x20         [--nbest N] [--lm-weight F]\n\
+        "usage: ecriture-rs [--pth FICHIER] [--repo owner/name] [--input-h N] [--input-w N]\n\
+         \x20         [--norm 01|neg1] [--tablet-device /dev/input/eventN]\n\
+         \x20         [--lexicon PATH|none] [--beam N] [--nbest N] [--lm-weight F]\n\
          défauts: --repo Sachin-0001/crnn-iam-handwriting (téléchargé via Hugging Face),\n\
          \x20         --input-h depuis config.json, --norm neg1, --lexicon embarqué (français),\n\
          \x20         --beam 16, --nbest 8, --lm-weight 2.0,\n\
-         \x20         tablette: auto-détection (ou ECRITURE_TABLET_DEVICE)"
+         \x20         tablette: auto-détection (ou ECRITURE_TABLET_DEVICE)\n\
+         \n\
+         --pth FICHIER : checkpoint local, format détecté depuis les fichiers à côté :\n\
+         \x20         - syms.txt présent -> PyLaIA (ex. modèle FR Teklia/pylaia-rimes) :\n\
+         \x20           cargo run --release -- --pth ~/modeles/pylaia-rimes/weights.ckpt\n\
+         \x20         - config.json avec arch/vocab -> doctR (pytorch_model.bin + config.json)\n\
+         \x20         - sinon Sachin-0001 (model.pth + vocab.json + config.json)\n\
+         --repo Felix92/doctr-torch-crnn-mobilenet-v3-large-french : doctR FR téléchargé"
     );
     std::process::exit(2)
 }
@@ -449,6 +462,7 @@ fn parse_args() -> Config {
         pth: None,
         repo: "Sachin-0001/crnn-iam-handwriting".to_string(),
         input_h: None,
+        input_w: None,
         norm: Norm::NegOneOne,
         tablet_device: None,
         lexicon: None,
@@ -463,6 +477,13 @@ fn parse_args() -> Config {
             "--repo" => cfg.repo = args.next().unwrap_or_else(|| usage_exit()),
             "--input-h" => {
                 cfg.input_h = Some(
+                    args.next()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or_else(|| usage_exit()),
+                )
+            }
+            "--input-w" => {
+                cfg.input_w = Some(
                     args.next()
                         .and_then(|v| v.parse().ok())
                         .unwrap_or_else(|| usage_exit()),
@@ -530,19 +551,33 @@ fn main() -> eframe::Result<()> {
             }
         },
     };
-    let mconfig: model::ModelConfig = match std::fs::read_to_string(&config_json) {
-        Ok(c) => serde_json::from_str(&c).unwrap_or(model::ModelConfig {
-            num_classes: 80,
-            hidden_size: 256,
-            image_height: 32,
-        }),
-        Err(_) => model::ModelConfig {
-            num_classes: 80,
-            hidden_size: 256,
-            image_height: 32,
-        },
-    };
-    let input_h = cfg.input_h.unwrap_or(mconfig.image_height);
+    let config_text = std::fs::read_to_string(&config_json).unwrap_or_default();
+    let mconfig: model::ModelConfig =
+        serde_json::from_str(&config_text).unwrap_or_default();
+    // Backend PyLaIA si syms.txt est à côté du checkpoint (ex. Teklia/pylaia-rimes).
+    let pylaia_syms = pth
+        .parent()
+        .map(|d| d.join("syms.txt"))
+        .filter(|p| p.exists());
+    // Hauteur d'entrée : --input-h > 128 (PyLaIA) > image_height (Sachin) > input_shape[1] (doctr).
+    let input_h = cfg.input_h.unwrap_or_else(|| {
+        if pylaia_syms.is_some() {
+            128
+        } else {
+            mconfig
+                .image_height
+                .or_else(|| mconfig.input_shape.as_ref().and_then(|s| s.get(1).copied().map(|v| v as u32)))
+                .unwrap_or(32)
+        }
+    });
+    // Largeur fixe pour doctR (Sachin garde le ratio, pas de largeur fixe).
+    let input_w = cfg.input_w.unwrap_or_else(|| {
+        mconfig
+            .input_shape
+            .as_ref()
+            .and_then(|s| s.get(2).copied().map(|v| v as u32))
+            .unwrap_or(128)
+    });
 
     // Lexique de langue pour le rescoring N-best : embarqué (français) par
     // défaut, fichier local avec --lexicon PATH, désactivé avec --lexicon none.
@@ -562,11 +597,13 @@ fn main() -> eframe::Result<()> {
         None => "désactivé".to_string(),
     };
     eprintln!(
-        "config: pth={} repo={} input_h={} norm={:?} tablet_device={:?} beam={} nbest={} lm_weight={} lexique={}",
+        "config: pth={} repo={} input_h={} input_w={} norm={:?} backend={} tablet_device={:?} beam={} nbest={} lm_weight={} lexique={}",
         pth.display(),
         cfg.repo,
         input_h,
+        input_w,
         cfg.norm,
+        if pylaia_syms.is_some() { "pylaia" } else if mconfig.is_doctr() { "doctr" } else { "sachin" },
         cfg.tablet_device,
         cfg.beam,
         cfg.nbest,
@@ -587,16 +624,36 @@ fn main() -> eframe::Result<()> {
         Box::new(|cc| {
             let device = candle_core::Device::Cpu;
             // Modèle réel si présent, sinon bouchon pour tester l'UI.
-            let recognizer: Box<dyn Recognizer> = match CrnnRecognizer::with_options(
-                &pth,
-                &vocab_json,
-                mconfig.num_classes,
-                mconfig.hidden_size,
-                input_h,
-                cfg.norm,
-                decode_opts,
-                &device,
-            ) {
+            // Le format est détecté depuis les fichiers à côté du checkpoint :
+            // syms.txt -> PyLaIA, arch/vocab dans config.json -> doctR,
+            // sinon "Sachin-0001" (vocab.json + config.json).
+            let built: anyhow::Result<CrnnRecognizer> = if let Some(syms) = &pylaia_syms {
+                CrnnRecognizer::with_pylaia(&pth, syms, input_h, decode_opts, &device)
+            } else if mconfig.is_doctr() {
+                let dcfg: doctr::DoctrConfig = serde_json::from_str(&config_text)
+                    .context("config.json doctR invalide")?;
+                CrnnRecognizer::with_doctr(
+                    &pth,
+                    &dcfg,
+                    128, // rnn_units doctR
+                    input_h,
+                    input_w,
+                    decode_opts,
+                    &device,
+                )
+            } else {
+                CrnnRecognizer::with_options(
+                    &pth,
+                    &vocab_json,
+                    mconfig.num_classes.unwrap_or(80),
+                    mconfig.hidden_size.unwrap_or(256),
+                    input_h,
+                    cfg.norm,
+                    decode_opts,
+                    &device,
+                )
+            };
+            let recognizer: Box<dyn Recognizer> = match built {
                 Ok(r) => Box::new(r),
                 Err(e) => {
                     eprintln!("{} illisible ({e:#}) : utilisation du MockRecognizer", pth.display());

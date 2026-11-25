@@ -80,10 +80,10 @@ cargo test -- --ignored --nocapture # test réel : télécharge le modèle HF et
 
 ## Roadmap
 
-- Modèle **stroke-based** (séquences x, y, t, pression) au lieu du rendu image, pour un vrai temps réel.
-- **Fenêtre glissante** avec hypothèses révisables : le texte se corrige en direct.
-- **Segmentation** en mots/gestes (double-tap = espace, geste = retour à la ligne).
-- Valider la qualité de reconnaissance du CRNN IAM sur de l'écriture réelle.
+- **Modèle de trajectoires (online)** : `ink::strokes_to_features` produit déjà les features `[1, T, 8]` (x, y, dx, dy, dt, pression, cos/sin) ; `Recognizer::recognize_strokes` existe (fallback image CRNN pour l'instant). Reste à brancher un LRU/petit transformer exporté en ONNX (`[1, T, F]`), inféré en pur Rust via **rten** (ou candle), avec état récurrent entre les appels. Le CRNN image reste la baseline mesurable (latence + CER).
+- ~~**Fenêtre glissante** avec hypothèses révisables~~ fait : les strokes non finalisés sont re-reconnus au debounce (0,6 s) et remplacés (hypothèse en gris) ; figés après 2 s de pause ou au-delà de 12 strokes.
+- **Segmentation** en mots/gestes (double-tap = espace, geste = retour à la ligne) via un petit classifieur séparé.
+- Quantifier le modèle (int8) et viser < 50 ms par fenêtre ; valider le CER sur tes propres strokes.
 
 ## Licence
 

@@ -35,6 +35,14 @@ pub trait Recognizer {
     fn last_input_image(&self) -> Option<&GrayImage> {
         None
     }
+
+    /// Reconnaissance de trajectoires (online). Par défaut : rendu en image
+    /// puis `recognize` (baseline CRNN). Un modèle de séquences (LRU/transformer
+    /// sur features [1, T, F]) surchargera cette méthode.
+    fn recognize_strokes(&mut self, strokes: &[crate::ink::Stroke]) -> Result<String> {
+        let img = crate::ink::render_to_image(strokes, 64);
+        self.recognize(&img)
+    }
 }
 
 /// Décodage glouton CTC : argmax par pas de temps, dédoublonnage,

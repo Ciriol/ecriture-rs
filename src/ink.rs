@@ -38,6 +38,47 @@ impl Stroke {
         self.points.is_empty()
     }
 
+    /// Rééchantillonne à exactement `n` points, par longueur d'arc,
+    /// en interpolant aussi le temps et la pression. Pour les modèles
+    /// de trajectoires (entrée [1, T, F]).
+    pub fn resample_n_points(&self, n: usize) -> Vec<Point> {
+        if self.points.len() < 2 || n < 2 {
+            return self.points.clone();
+        }
+        let mut len = 0.0f32;
+        for w in self.points.windows(2) {
+            len += ((w[1].x - w[0].x).powi(2) + (w[1].y - w[0].y).powi(2)).sqrt();
+        }
+        if len <= 0.0 {
+            return vec![self.points[0]; n];
+        }
+        let step = len / (n - 1) as f32;
+        let mut out = Vec::with_capacity(n);
+        out.push(self.points[0]);
+        let mut acc = 0.0f32;
+        for w in self.points.windows(2) {
+            let (a, b) = (&w[0], &w[1]);
+            let d = ((b.x - a.x).powi(2) + (b.y - a.y).powi(2)).sqrt();
+            let mut s = step - acc;
+            while s <= d {
+                let r = if d > 0.0 { s / d } else { 0.0 };
+                out.push(Point {
+                    x: a.x + r * (b.x - a.x),
+                    y: a.y + r * (b.y - a.y),
+                    t: a.t + r as f64 * (b.t - a.t),
+                    pressure: a.pressure + r * (b.pressure - a.pressure),
+                });
+                s += step;
+            }
+            acc = d - (s - step);
+        }
+        while out.len() < n {
+            out.push(*out.last().unwrap());
+        }
+        out.truncate(n);
+        out
+    }
+
     /// Rééchantillonnage à pas constant : utile pour les modèles
     /// entraînés sur des séquences normalisées.
     pub fn resample(&self, step: f32) -> Vec<(f32, f32)> {
@@ -135,5 +176,75 @@ fn draw_line(img: &mut GrayImage, x0: f32, y0: f32, x1: f32, y1: f32, thickness:
                 }
             }
         }
+    }
+}
+
+/// Nombre de features par point de trajectoire :
+/// x, y, dx, dy, dt, pression, cos(direction), sin(direction).
+pub const FEATURE_F: usize = 8;
+
+/// Features de trajectoire normalisées pour un groupe de strokes, prêtes à
+/// être sérialisées en tenseur [1, T_total, FEATURE_F] pour un modèle de
+/// séquences (LRU/transformer). Chaque stroke est rééchantillonné à
+/// `t_per_stroke` points ; positions centrées/réduites via la bounding box,
+/// dt normalisé (÷ 100 ms, clampé à 1).
+pub fn strokes_to_features(strokes: &[Stroke], t_per_stroke: usize) -> Vec<f32> {
+    let (min_x, min_y, max_x, max_y) = bounding_box(strokes).unwrap_or((0.0, 0.0, 1.0, 1.0));
+    let cx = (min_x + max_x) / 2.0;
+    let cy = (min_y + max_y) / 2.0;
+    let scale = (max_x - min_x).max(max_y - min_y).max(1.0);
+    let mut out = Vec::with_capacity(strokes.len() * t_per_stroke * FEATURE_F);
+    let mut prev: Option<Point> = None;
+    for stroke in strokes {
+        for p in stroke.resample_n_points(t_per_stroke) {
+            let px = (p.x - cx) / scale;
+            let py = (p.y - cy) / scale;
+            let (dx, dy, dt) = match &prev {
+                Some(q) => (
+                    (p.x - q.x) / scale,
+                    (p.y - q.y) / scale,
+                    (((p.t - q.t).max(0.0) / 0.1).min(1.0)) as f32,
+                ),
+                None => (0.0, 0.0, 0.0),
+            };
+            let dir = dy.atan2(dx);
+            out.extend_from_slice(&[px, py, dx, dy, dt, p.pressure, dir.cos(), dir.sin()]);
+            prev = Some(p);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn features_shape_et_normalisation() {
+        let mut s = Stroke::new();
+        for i in 0..50 {
+            s.push(Point {
+                x: i as f32,
+                y: (i as f32 / 5.0).sin() * 10.0,
+                t: i as f64 * 0.016,
+                pressure: 0.5,
+            });
+        }
+        let feats = strokes_to_features(&[s], 32);
+        assert_eq!(feats.len(), 32 * FEATURE_F);
+        // positions normalisées dans [-1, 1]
+        for v in feats.chunks(FEATURE_F) {
+            assert!(v[0].abs() <= 1.0 && v[1].abs() <= 1.0);
+        }
+    }
+
+    #[test]
+    fn resample_n_points_compte_exact() {
+        let mut s = Stroke::new();
+        for i in 0..10 {
+            s.push(Point { x: i as f32 * 3.0, y: 0.0, t: i as f64, pressure: 1.0 });
+        }
+        assert_eq!(s.resample_n_points(16).len(), 16);
+        assert_eq!(s.resample_n_points(2).len(), 2);
     }
 }

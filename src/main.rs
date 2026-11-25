@@ -13,15 +13,22 @@ use ink::{Point, Stroke};
 use recognizer::{CrnnRecognizer, MockRecognizer, Norm, Recognizer};
 use tablet::TabletEvent;
 
-/// Délai de pause (en secondes) après lequel on reconnaît les nouveaux strokes.
+/// Délai de pause (en secondes) après lequel on re-reconnaît la fenêtre en cours.
 const DEBOUNCE_SECS: f64 = 0.6;
+/// Pause plus longue (s) après laquelle la fenêtre en cours est figée dans le texte.
+const FINALIZE_PAUSE_SECS: f64 = 2.0;
+/// Nombre max de strokes non finalisés dans la fenêtre glissante.
+const WINDOW_MAX_STROKES: usize = 12;
 
 struct InkApp {
     strokes: Vec<Stroke>,
     current: Option<Stroke>,
+    /// Texte finalisé (figé).
     result: String,
-    /// Nombre de strokes déjà intégrés dans `result`.
-    recognized_up_to: usize,
+    /// Hypothèse courante de la fenêtre glissante (révisable, affichée en gris).
+    pending_text: String,
+    /// Nombre de strokes finalisés (intégrés dans `result`).
+    finalized: usize,
     /// Temps (s) du dernier point tracé.
     last_draw_time: f64,
     recognizer: Box<dyn Recognizer>,
@@ -50,7 +57,8 @@ impl InkApp {
             strokes: Vec::new(),
             current: None,
             result: String::new(),
-            recognized_up_to: 0,
+            pending_text: String::new(),
+            finalized: 0,
             last_draw_time: 0.0,
             recognizer,
             touch_active: false,
@@ -86,40 +94,46 @@ impl InkApp {
         }
     }
 
-    /// Reconnaissance complète (bouton) : on repart de zéro.
+    /// Reconnaissance complète (bouton) : tout est figé dans `result`.
     fn recognize_all(&mut self) {
         if self.strokes.is_empty() && self.current.is_none() {
             self.result = "( rien à reconnaître )".to_string();
             return;
         }
-        let img = ink::render_to_image(&self.strokes, 64);
-        match self.recognizer.recognize(&img) {
+        match self.recognizer.recognize_strokes(&self.strokes) {
             Ok(text) => self.result = text,
             Err(e) => self.result = format!("erreur: {e:#}"),
         }
         self.update_debug_img();
-        self.recognized_up_to = self.strokes.len();
+        self.finalized = self.strokes.len();
+        self.pending_text.clear();
     }
 
-    /// Reconnaissance incrémentale : uniquement les strokes tracés
-    /// depuis le dernier appel, ajoutés à la suite du texte reconnu.
-    fn recognize_pending(&mut self) {
-        let pending = &self.strokes[self.recognized_up_to..];
+    /// Re-reconnaît la fenêtre glissante (strokes non finalisés) et REMPLACE
+    /// l'hypothèse en cours : le texte se corrige en direct.
+    fn recognize_window(&mut self) {
+        let pending = &self.strokes[self.finalized..];
         if pending.is_empty() {
+            self.pending_text.clear();
             return;
         }
-        let img = ink::render_to_image(pending, 64);
-        match self.recognizer.recognize(&img) {
-            Ok(text) => {
-                if !self.result.is_empty() && !text.is_empty() {
-                    self.result.push(' ');
-                }
-                self.result.push_str(&text);
-            }
-            Err(e) => self.result = format!("erreur: {e:#}"),
+        match self.recognizer.recognize_strokes(pending) {
+            Ok(text) => self.pending_text = text,
+            Err(e) => self.pending_text = format!("erreur: {e:#}"),
         }
         self.update_debug_img();
-        self.recognized_up_to = self.strokes.len();
+    }
+
+    /// Fige la fenêtre courante dans le texte finalisé.
+    fn finalize_window(&mut self) {
+        if !self.pending_text.is_empty() {
+            if !self.result.is_empty() {
+                self.result.push(' ');
+            }
+            self.result.push_str(&self.pending_text);
+        }
+        self.finalized = self.strokes.len();
+        self.pending_text.clear();
     }
 
     /// En mode debug, récupère l'image envoyée au modèle pour l'afficher.
@@ -147,7 +161,8 @@ impl eframe::App for InkApp {
                     self.strokes.clear();
                     self.current = None;
                     self.result.clear();
-                    self.recognized_up_to = 0;
+                    self.pending_text.clear();
+                    self.finalized = 0;
                 }
                 ui.label(format!("{} strokes", self.strokes.len()));
                 ui.checkbox(&mut self.debug, "debug");
@@ -157,7 +172,15 @@ impl eframe::App for InkApp {
         egui::Panel::bottom("result").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label("Texte reconnu :");
+                // Texte finalisé en noir, hypothèse de la fenêtre en cours en gris.
                 ui.label(egui::RichText::new(&self.result).monospace());
+                if !self.pending_text.is_empty() {
+                    ui.label(
+                        egui::RichText::new(&self.pending_text)
+                            .monospace()
+                            .color(egui::Color32::GRAY),
+                    );
+                }
             });
             if self.debug {
                 ui.label(egui::RichText::new(&self.debug_info).monospace().small());
@@ -322,13 +345,35 @@ impl eframe::App for InkApp {
             }
         });
 
-        // Reconnaissance incrémentale : après une pause de tracé,
-        // on reconnaît uniquement les nouveaux strokes et on les ajoute au texte.
+        // Fenêtre glissante : après une pause de tracé, on re-reconnaît les
+        // strokes non finalisés (l'hypothèse se corrige en direct) ; après une
+        // pause plus longue (ou si la fenêtre dépasse WINDOW_MAX_STROKES), on
+        // fige la fenêtre dans le texte finalisé.
         let now = ui.ctx().input(|i| i.time);
-        let pending = self.strokes.len().saturating_sub(self.recognized_up_to);
-        if pending > 0 && now - self.last_draw_time > DEBOUNCE_SECS {
-            self.recognize_pending();
-        } else if pending > 0 {
+        let pending = self.strokes.len().saturating_sub(self.finalized);
+        if pending > 0 {
+            let pause = now - self.last_draw_time;
+            if pause > FINALIZE_PAUSE_SECS || pending > WINDOW_MAX_STROKES {
+                // fige les plus vieux strokes pour ne garder que la fenêtre
+                if pending > WINDOW_MAX_STROKES {
+                    let keep = WINDOW_MAX_STROKES / 2;
+                    let split = self.strokes.len() - keep;
+                    let window: Vec<Stroke> = self.strokes[..split].to_vec();
+                    if let Ok(text) = self.recognizer.recognize_strokes(&window) {
+                        if !text.is_empty() {
+                            if !self.result.is_empty() {
+                                self.result.push(' ');
+                            }
+                            self.result.push_str(&text);
+                        }
+                    }
+                    self.finalized = split;
+                } else {
+                    self.finalize_window();
+                }
+            } else if pause > DEBOUNCE_SECS {
+                self.recognize_window();
+            }
             // On reprogramme un rafraîchissement pour surveiller la pause.
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
         }

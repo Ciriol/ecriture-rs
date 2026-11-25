@@ -63,7 +63,7 @@ Priorité de résolution : `--pth` > `--weights-url` > `--weights-dir` > auto-lo
 | `--nbest N` | `8` | nombre d'hypothèses N-best rescorées par le lexique |
 | `--lm-weight F` | `2.0` | poids du lexique : `score = logp_ctc/len + F × couverture_lexicale` (`0` = désactivé) |
 
-Dans l'UI : tracer dans la zone centrale, **Reconnaître** (tout relire), **Effacer**, case **debug** (événements d'entrée reçus).
+Dans l'UI : tracer dans la zone centrale, **Reconnaître** (tout relire), **Effacer**, case **debug** (événements d'entrée reçus). En haut à droite, le **menu déroulant indique le modèle actif** (source, backend, taille d'entrée) et permet d'en **changer à chaud** — le chargement (téléchargement HF + parsing du checkpoint) se fait en arrière-plan, l'UI affiche « chargement… » puis re-reconnaît le texte à l'écran avec le nouveau modèle. Choix proposés : `Sachin-0001/crnn-iam-handwriting` (IAM anglais), `Teklia/pylaia-rimes` (PyLaIA français), `Felix92/doctr-torch-crnn-mobilenet-v3-large-french` (doctR français), plus la source passée en CLI si c'est un modèle local. Le panneau du **texte reconnu en bas est redimensionnable** (tirer sa bordure haute, 120–500 px, 200 px par défaut) : texte finalisé en 28 pt, hypothèse de la fenêtre glissante en gris en dessous.
 
 Exemples avec un modèle local :
 

@@ -27,7 +27,9 @@ impl Norm {
     }
 }
 
-pub trait Recognizer {
+/// `Send` : l'UI charge un autre modèle dans un thread d'arrière-plan et
+/// renvoie le reconnaisseur via un channel.
+pub trait Recognizer: Send {
     fn recognize(&mut self, img: &GrayImage) -> Result<String>;
 
     /// Dernière image effectivement envoyée au modèle (après redimensionnement
@@ -184,6 +186,7 @@ pub fn rescore_nbest(nbest: &[(String, f64)], lexicon: &crate::lexicon::Lexicon,
 }
 
 /// Options de décodage CTC + rescoring par lexique.
+#[derive(Clone)]
 pub struct DecodeOptions {
     /// Largeur du beam CTC (1 = décodage glouton).
     pub beam_size: usize,

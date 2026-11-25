@@ -80,6 +80,28 @@ impl InkApp {
         // Le thread evdev réveille egui (request_repaint) à chaque événement.
         let (tx, rx) = channel();
         tablet::spawn_readers(tx, tablet_device, ctx);
+        Self::with_tablet_rx(
+            recognizer,
+            model_desc,
+            model_sources,
+            model_index,
+            cfg,
+            decode_opts,
+            Some(rx),
+        )
+    }
+
+    /// Construit l'app avec le channel tablette fourni (`None` = pas de
+    /// lecture evdev ; utilisé par les tests).
+    fn with_tablet_rx(
+        recognizer: Box<dyn Recognizer>,
+        model_desc: String,
+        model_sources: Vec<ModelSource>,
+        model_index: usize,
+        cfg: Config,
+        decode_opts: DecodeOptions,
+        tablet_rx: Option<Receiver<TabletEvent>>,
+    ) -> Self {
         Self {
             strokes: Vec::new(),
             current: None,
@@ -93,7 +115,7 @@ impl InkApp {
             debug: false,
             debug_info: String::new(),
             debug_img: None,
-            tablet_rx: Some(rx),
+            tablet_rx,
             tablet_count: 0,
             model_sources,
             model_index,
@@ -159,6 +181,84 @@ impl InkApp {
                 self.strokes.push(stroke);
                 self.last_draw_time = now;
             }
+        }
+    }
+
+    /// Capture du tracé souris/touch dans le canvas. On ne se fie pas qu'à la
+    /// Response du canvas : on lit l'état global du pointer (souris, ou stylet
+    /// émulé en bouton principal) ET les événements touch bruts — un stylet
+    /// sous Wayland arrive en `Event::Touch` avec une force (pression).
+    ///
+    /// Souris et touch sont traités SÉPARÉMENT : la souris ne trace que si un
+    /// bouton est réellement enfoncé (`down`), donc un `touch_active` resté
+    /// bloqué (Touch Start sans End) ne fait pas tracer la souris en hover.
+    fn handle_pointer_input(&mut self, ui: &egui::Ui, rect: egui::Rect, now: f64) {
+        let (mut touch_started, mut touch_ended, mut pressure, mut touch_pos) =
+            (false, false, 1.0f32, None);
+        ui.input(|i| {
+            for ev in &i.events {
+                if let egui::Event::Touch { phase, pos, force, .. } = ev {
+                    match phase {
+                        egui::TouchPhase::Start => {
+                            touch_started = true;
+                            touch_pos = Some(*pos);
+                        }
+                        egui::TouchPhase::Move => {
+                            touch_pos = Some(*pos);
+                        }
+                        egui::TouchPhase::End | egui::TouchPhase::Cancel => {
+                            touch_ended = true;
+                        }
+                    }
+                    if let Some(f) = force {
+                        pressure = *f;
+                    }
+                }
+            }
+        });
+        if touch_started {
+            self.touch_active = true;
+        }
+        if let Some(p) = touch_pos {
+            self.last_touch_pos = Some(p);
+        }
+        if touch_ended {
+            self.touch_active = false;
+            self.last_touch_pos = None;
+        }
+
+        let (pressed, down, released, pointer_pos) = ui.input(|i| {
+            let p = &i.pointer;
+            (p.any_pressed(), p.any_down(), p.any_released(), p.latest_pos())
+        });
+
+        // Démarre un stroke uniquement sur un vrai début d'input (bouton
+        // pressé ou touch start) avec le pointeur dans le canvas.
+        let start_pos = touch_pos.or(pointer_pos);
+        if (pressed || touch_started) && start_pos.map(|p| rect.contains(p)).unwrap_or(false) {
+            self.current = Some(Stroke::new());
+        }
+
+        // Souris : tracer UNIQUEMENT si un bouton est réellement enfoncé.
+        if down && !touch_ended {
+            if let Some(p) = pointer_pos {
+                if rect.contains(p) {
+                    self.push_point(p, pressure, now, rect);
+                }
+            }
+        }
+        // Touch / stylet : tracer tant que le contact est actif.
+        if self.touch_active && !touch_ended {
+            if let Some(p) = touch_pos.or(self.last_touch_pos) {
+                if rect.contains(p) {
+                    self.push_point(p, pressure, now, rect);
+                }
+            }
+        }
+        // Termine le stroke sur relâchement / fin de touch, ou si plus aucun
+        // input n'est actif (évite un stroke fantôme bloqué).
+        if released || touch_ended || (!down && !self.touch_active) {
+            self.end_stroke(now);
         }
     }
 
@@ -340,68 +440,10 @@ impl eframe::App for InkApp {
                 draw_stroke(&painter, stroke, response.rect);
             }
 
-            // Capture du tracé. On ne se fie pas qu'à la Response du canvas :
-            // on lit l'état global du pointer (souris, ou stylet émulé en
-            // bouton principal) ET les événements touch bruts — un stylet
-            // sous Wayland arrive en Event::Touch avec une force (pression).
+            // Capture du tracé (souris + touch) dans le canvas.
             let now = ui.input(|i| i.time);
             let rect = response.rect;
-
-            let (mut touch_started, mut touch_ended, mut pressure, mut touch_pos) =
-                (false, false, 1.0f32, None);
-            ui.input(|i| {
-                for ev in &i.events {
-                    if let egui::Event::Touch { phase, pos, force, .. } = ev {
-                        match phase {
-                            egui::TouchPhase::Start => {
-                                touch_started = true;
-                                touch_pos = Some(*pos);
-                            }
-                            egui::TouchPhase::Move => {
-                                touch_pos = Some(*pos);
-                            }
-                            egui::TouchPhase::End | egui::TouchPhase::Cancel => {
-                                touch_ended = true;
-                            }
-                        }
-                        if let Some(f) = force {
-                            pressure = *f;
-                        }
-                    }
-                }
-            });
-            if touch_started {
-                self.touch_active = true;
-            }
-            if let Some(p) = touch_pos {
-                self.last_touch_pos = Some(p);
-            }
-            if touch_ended {
-                self.touch_active = false;
-                self.last_touch_pos = None;
-            }
-
-            let (pressed, down, released, pointer_pos) = ui.input(|i| {
-                let p = &i.pointer;
-                (p.any_pressed(), p.any_down(), p.any_released(), p.latest_pos())
-            });
-            let pos = pointer_pos.or(self.last_touch_pos);
-            let pos_in = pos.filter(|p| rect.contains(*p));
-            let drawing = down || self.touch_active;
-
-            if (pressed || touch_started) && pos_in.is_some() {
-                self.current = Some(Stroke::new());
-            }
-            if drawing && !touch_ended {
-                if let Some(p) = pos {
-                    if rect.contains(p) {
-                        self.push_point(p, pressure, now, rect);
-                    }
-                }
-            }
-            if released || touch_ended {
-                self.end_stroke(now);
-            }
+            self.handle_pointer_input(ui, rect, now);
 
             // Tracé au stylet lu directement via evdev (winit ne remonte pas
             // toujours le périphérique à egui). Coordonnées normalisées 0..1
@@ -1049,5 +1091,154 @@ mod tests {
         assert!(desc.contains("h=128"), "desc={desc}");
         let s = Stroke::new();
         assert!(r.recognize_strokes(&[s]).is_ok());
+    }
+
+    // ---- Simulation d'input egui (capture souris/touch du canvas) ----
+
+    fn app_test() -> InkApp {
+        let src = ModelSource::Repo("Sachin-0001/crnn-iam-handwriting".into());
+        InkApp::with_tablet_rx(
+            Box::new(MockRecognizer),
+            "mock".to_string(),
+            model_choices(&src),
+            0,
+            Config::default(),
+            DecodeOptions::default(),
+            None,
+        )
+    }
+
+    /// Simule une frame egui avec les événements d'input donnés, comme le
+    /// fait le CentralPanel de l'app.
+    fn run_frame(app: &mut InkApp, ctx: &egui::Context, events: Vec<egui::Event>) {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            time: Some(1.0),
+            events,
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(raw, |ui| {
+            let (response, _painter) =
+                ui.allocate_painter(ui.available_size(), egui::Sense::drag());
+            let now = ui.input(|i| i.time);
+            app.handle_pointer_input(ui, response.rect, now);
+        });
+        // Hors écran, personne n'applique les deltas de textures (fonts...) :
+        // on les vide pour éviter le panic au drop.
+        output.textures_delta.clear();
+    }
+
+    fn ptr_button(pos: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        }
+    }
+
+    fn touch_event(phase: egui::TouchPhase, pos: egui::Pos2) -> egui::Event {
+        egui::Event::Touch {
+            device_id: egui::TouchDeviceId(0),
+            id: egui::TouchId(1),
+            phase,
+            pos,
+            force: Some(1.0),
+        }
+    }
+
+    #[test]
+    fn hover_souris_seul_ne_trace_pas() {
+        let ctx = egui::Context::default();
+        let mut app = app_test();
+        run_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(egui::pos2(400.0, 300.0))]);
+        run_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(egui::pos2(500.0, 400.0))]);
+        assert!(app.current.is_none(), "un stroke a été créé en hover");
+        assert!(app.strokes.is_empty());
+    }
+
+    #[test]
+    fn clic_maintenu_puis_release_archive_un_stroke() {
+        let ctx = egui::Context::default();
+        let mut app = app_test();
+        run_frame(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(egui::pos2(400.0, 300.0)),
+                ptr_button(egui::pos2(400.0, 300.0), true),
+            ],
+        );
+        run_frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerMoved(egui::pos2(450.0, 320.0))],
+        );
+        assert!(app.current.is_some(), "pas de stroke en cours pendant le clic");
+        run_frame(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(egui::pos2(460.0, 330.0)),
+                ptr_button(egui::pos2(460.0, 330.0), false),
+            ],
+        );
+        assert!(app.current.is_none(), "stroke non terminé au release");
+        assert_eq!(app.strokes.len(), 1);
+        assert!(app.strokes[0].points.len() >= 2);
+    }
+
+    #[test]
+    fn touch_actif_ne_fait_pas_tracer_la_souris_en_hover() {
+        // Un Touch Start est reçu (contact tactile) ; puis la SOURIS bouge en
+        // hover (aucun bouton enfoncé) : elle ne doit rien ajouter au stroke.
+        let ctx = egui::Context::default();
+        let mut app = app_test();
+        run_frame(
+            &mut app,
+            &ctx,
+            vec![touch_event(egui::TouchPhase::Start, egui::pos2(400.0, 300.0))],
+        );
+        assert!(app.current.is_some(), "le touch start doit créer un stroke");
+        let p0 = app.current.as_ref().unwrap().points[0];
+        run_frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerMoved(egui::pos2(700.0, 550.0))],
+        );
+        let cur = app.current.as_ref().expect("stroke touch en cours");
+        let last = *cur.points.last().unwrap();
+        assert!(
+            (last.x - p0.x).abs() < 0.5 && (last.y - p0.y).abs() < 0.5,
+            "la souris a tracé en hover pendant un touch actif: p0={p0:?} last={last:?}"
+        );
+    }
+
+    #[test]
+    fn touch_start_puis_end_ne_laisse_pas_de_stroke_bloque() {
+        let ctx = egui::Context::default();
+        let mut app = app_test();
+        run_frame(
+            &mut app,
+            &ctx,
+            vec![touch_event(egui::TouchPhase::Start, egui::pos2(400.0, 300.0))],
+        );
+        run_frame(
+            &mut app,
+            &ctx,
+            vec![touch_event(egui::TouchPhase::End, egui::pos2(400.0, 300.0))],
+        );
+        assert!(app.current.is_none());
+        assert_eq!(app.strokes.len(), 1);
+        // Après le End, un hover souris ne doit rien créer de plus.
+        run_frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerMoved(egui::pos2(600.0, 500.0))],
+        );
+        assert!(app.current.is_none() && app.strokes.len() == 1);
     }
 }

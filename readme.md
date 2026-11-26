@@ -104,6 +104,10 @@ ecriture-rs/
 │   ├── doctr.rs        CRNN doctR mobilenet_v3_large (pytorch_model.bin)
 │   ├── pylaia.rs       CRNN PyLaIA LaiaCRNN (weights.ckpt + syms.txt, ex. RIMES FR)
 │   └── recognizer.rs   trait Recognizer, 3 backends, beam CTC N-best + rescoring lexique
+│   └── bin/
+│       └── uinput-pilot.rs  pilote de périphériques virtuels (souris/stylet) via /dev/uinput
+├── tools/
+│   └── scenario-stylet-puis-souris.txt  scénario d'injection uinput-pilot (exemple)
 ├── examples/
 │   ├── dump_pth.rs     liste les tenseurs d'un checkpoint torch
 │   ├── export_pth.rs   exporte un checkpoint en .f32 bruts (debug cross-framework)
@@ -133,6 +137,36 @@ lexique** (`--lm-weight`, lexique français embarqué par défaut). Benchmarks r
   lignes (le modèle annonce 4.5 % sur les 778 lignes du test)
 - Parité Rust vs PyTorch validée sur les 3 backends (logits max|diff| < 6e-5) :
   `cargo test --release -- --ignored parite`
+
+## Tester l'input (record/replay + pilote uinput)
+
+Deux outils 100 % libres pour reproduire et diagnostiquer les bugs d'interface
+(souris qui trace en hover, stylet bloqué, etc.) sans cliquer à la main :
+
+**Record / replay déterministe** — enregistrer une session d'input et la rejouer
+en headless (sans fenêtre, modèle simulé), ex. en CI :
+
+```bash
+# enregistrer tous les événements (souris, touch, tablette evdev) en JSONL :
+cargo run --release -- --record-input /tmp/events.jsonl
+# ... reproduire le bug à la souris/stylet, quitter l'app ...
+# rejouer le fichier : affiche les strokes produits frame par frame :
+cargo run --release -- --replay-input /tmp/events.jsonl
+```
+
+**Pilote uinput** — injecter de vrais périphériques virtuels (souris + stylet)
+dans la session via `/dev/uinput` (groupe `input`, comme pour la lecture evdev),
+pilotés par un fichier scénario :
+
+```bash
+cargo run --release --bin uinput-pilot -- tools/scenario-stylet-puis-souris.txt
+# commandes : screen W H | mouse | pen | mmove dx dy | mdown/mup/mclick |
+#             pmove x y | pdown [p] | pup | sleep ms   (# = commentaire)
+```
+
+Combiner les deux : lancer l'app avec `--record-input`, injecter un scénario
+avec `uinput-pilot`, puis rejouer le JSONL — le bug est figé et rejouable à
+l'identique (couvert par les tests `record_puis_replay_*`).
 
 ## Roadmap
 

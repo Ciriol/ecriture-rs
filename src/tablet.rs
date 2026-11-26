@@ -12,9 +12,10 @@ use std::sync::mpsc::Sender;
 use std::thread;
 
 use evdev::{AbsoluteAxisCode, Device, EventType, KeyCode};
+use serde::{Deserialize, Serialize};
 
 /// Événement stylet, coordonnées normalisées 0..1 dans l'espace de l'écran.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub enum TabletEvent {
     Down { x: f32, y: f32, pressure: f32 },
     Move { x: f32, y: f32, pressure: f32 },

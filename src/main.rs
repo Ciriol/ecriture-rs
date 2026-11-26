@@ -81,6 +81,20 @@ struct InkApp {
     last_auto_label: String,
     /// Statut du dernier export InkML (chemin écrit ou erreur).
     export_status: String,
+    /// Enregistreur d'input (--record-input) : une ligne JSONL par frame egui
+    /// et par batch d'événements tablette evdev.
+    recorder: Option<std::io::BufWriter<std::fs::File>>,
+    /// Nombre de frames enregistrées (flush périodique du BufWriter).
+    recorded_frames: u64,
+}
+
+/// Une ligne d'un fichier d'enregistrement d'input (JSONL) : soit une frame
+/// egui complète (`RawInput` sérialisé, avec time + events), soit un batch
+/// d'événements tablette lus via evdev (qui ne passent pas par winit).
+#[derive(serde::Serialize, serde::Deserialize)]
+enum RecordedLine {
+    Frame(egui::RawInput),
+    Tablet(Vec<TabletEvent>),
 }
 
 impl InkApp {
@@ -98,15 +112,25 @@ impl InkApp {
         // Le thread evdev réveille egui (request_repaint) à chaque événement.
         let (tx, rx) = channel();
         tablet::spawn_readers(tx, tablet_device, ctx);
-        Self::with_tablet_rx(
+        let mut app = Self::with_tablet_rx(
             recognizer,
             model_desc,
             model_sources,
             model_index,
-            cfg,
+            cfg.clone(),
             decode_opts,
             Some(rx),
-        )
+        );
+        // --record-input : enregistre chaque frame dans un fichier JSONL.
+        app.recorder = cfg.record_input.as_ref().map(|p| {
+            let f = std::fs::File::create(p).unwrap_or_else(|e| {
+                eprintln!("record-input: impossible de créer {p}: {e}");
+                std::process::exit(1);
+            });
+            eprintln!("record-input: écriture des événements dans {p}");
+            std::io::BufWriter::new(f)
+        });
+        app
     }
 
     /// Construit l'app avec le channel tablette fourni (`None` = pas de
@@ -149,6 +173,42 @@ impl InkApp {
             export_label: String::new(),
             last_auto_label: String::new(),
             export_status: String::new(),
+            recorder: None,
+            recorded_frames: 0,
+        }
+    }
+
+    /// Enregistre la frame egui courante (RawInput complet : time, screen_rect,
+    /// events...) comme une ligne JSONL.
+    fn record_frame(&mut self, ctx: &egui::Context) {
+        use std::io::Write as _;
+        if let Some(w) = &mut self.recorder {
+            let raw = ctx.input(|i| i.raw.clone());
+            if let Ok(line) = serde_json::to_string(&RecordedLine::Frame(raw)) {
+                let _ = writeln!(w, "{line}");
+                self.recorded_frames += 1;
+                if self.recorded_frames % 20 == 0 {
+                    let _ = w.flush();
+                }
+            }
+        }
+    }
+
+    /// Enregistre un batch d'événements tablette (evdev) reçus cette frame.
+    fn record_tablet(&mut self, events: &[TabletEvent]) {
+        use std::io::Write as _;
+        if let Some(w) = &mut self.recorder {
+            if let Ok(line) = serde_json::to_string(&RecordedLine::Tablet(events.to_vec())) {
+                let _ = writeln!(w, "{line}");
+            }
+        }
+    }
+
+    /// Flush final du fichier d'enregistrement.
+    fn flush_recorder(&mut self) {
+        use std::io::Write as _;
+        if let Some(w) = &mut self.recorder {
+            let _ = w.flush();
         }
     }
 
@@ -400,6 +460,7 @@ impl InkApp {
         if tablet_events.is_empty() {
             return;
         }
+        self.record_tablet(&tablet_events);
         self.last_tablet_event = now;
         let screen = ctx.viewport_rect();
         for ev in tablet_events {
@@ -489,12 +550,25 @@ impl eframe::App for InkApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.ui_inner(ui);
     }
+
+    fn on_exit(&mut self) {
+        self.flush_recorder();
+    }
+}
+
+impl Drop for InkApp {
+    fn drop(&mut self) {
+        self.flush_recorder();
+    }
 }
 
 impl InkApp {
     /// Contenu complet de la fenêtre (extrait de `eframe::App::ui` pour être
     /// appelable dans un `egui::Context` de test).
     fn ui_inner(&mut self, ui: &mut egui::Ui) {
+        // --record-input : capture la frame courante avant tout traitement.
+        self.record_frame(ui.ctx());
+
         // Modèle chargé en arrière-plan : on bascule dessus.
         let loaded = self.model_rx.as_ref().and_then(|rx| rx.try_recv().ok());
         if let Some((rec, desc)) = loaded {
@@ -752,6 +826,83 @@ impl InkApp {
     }
 }
 
+/// Rejoue un fichier d'input enregistré avec --record-input dans un
+/// `egui::Context` headless (sans fenêtre) : chaque ligne `Frame` est passée
+/// à `ctx.run_ui`, chaque ligne `Tablet` est envoyée dans le channel evdev de
+/// l'app puis consommée par une frame. Retourne l'app résultante et le nombre
+/// de frames rejouées (pour les assertions des tests).
+fn replay_file(path: &str, cfg: &Config) -> anyhow::Result<(InkApp, u64)> {
+    use std::io::{BufRead, BufReader};
+    let file = std::fs::File::open(path).with_context(|| format!("ouverture de {path}"))?;
+    let src = initial_source(cfg);
+    let (tx, rx) = channel();
+    let mut app = InkApp::with_tablet_rx(
+        Box::new(MockRecognizer),
+        format!("replay {path} (reconnaissance simulée)"),
+        model_choices(&src),
+        0,
+        cfg.clone(),
+        DecodeOptions::default(),
+        Some(rx),
+    );
+    let ctx = egui::Context::default();
+    let mut last_time = 0.0f64;
+    let mut last_screen: Option<egui::Rect> = None;
+    let mut n_frames = 0u64;
+    for (lineno, line) in BufReader::new(file).lines().enumerate() {
+        let line = line.with_context(|| format!("lecture ligne {}", lineno + 1))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let rec: RecordedLine =
+            serde_json::from_str(&line).with_context(|| format!("parse ligne {}", lineno + 1))?;
+        match rec {
+            RecordedLine::Frame(raw) => {
+                if let Some(t) = raw.time {
+                    last_time = t;
+                }
+                if raw.screen_rect.is_some() {
+                    last_screen = raw.screen_rect;
+                }
+                let mut out = ctx.run_ui(raw, |ui| app.ui_inner(ui));
+                out.textures_delta.clear();
+                n_frames += 1;
+            }
+            RecordedLine::Tablet(evs) => {
+                for ev in evs {
+                    let _ = tx.send(ev);
+                }
+                // Frame "vide" (mêmes time/screen_rect) pour consommer le channel.
+                let raw = egui::RawInput {
+                    screen_rect: last_screen,
+                    time: Some(last_time),
+                    ..Default::default()
+                };
+                let mut out = ctx.run_ui(raw, |ui| app.ui_inner(ui));
+                out.textures_delta.clear();
+                n_frames += 1;
+            }
+        }
+    }
+    Ok((app, n_frames))
+}
+
+/// --replay-input : rejoue un enregistrement et affiche le résumé des strokes.
+fn run_replay(path: &str, cfg: &Config) -> anyhow::Result<()> {
+    let (app, n_frames) = replay_file(path, cfg)?;
+    println!("replay: {n_frames} frames depuis {path}");
+    println!("strokes archivés: {}", app.strokes.len());
+    for (i, s) in app.strokes.iter().enumerate() {
+        println!("  stroke {i}: {} points", s.points.len());
+    }
+    if let Some(cur) = &app.current {
+        println!("stroke en cours (non archivé): {} points", cur.points.len());
+    }
+    println!("result: {:?}", app.result);
+    println!("pending: {:?}", app.pending_text);
+    Ok(())
+}
+
 /// Exporte les strokes en InkML dans `dir` (créé si besoin), avec le label
 /// (vérité terrain). Retourne le chemin du fichier écrit.
 fn export_inkml_to(
@@ -832,6 +983,12 @@ struct Config {
     nbest: usize,
     /// Poids du lexique dans le rescoring (0 = désactivé).
     lm_weight: f64,
+    /// Enregistre tous les événements d'input (frames egui + tablette evdev)
+    /// dans un fichier JSONL, rejouable avec --replay-input.
+    record_input: Option<String>,
+    /// Rejoue un fichier --record-input en mode headless (sans fenêtre) et
+    /// affiche le résumé des strokes produits.
+    replay_input: Option<String>,
 }
 
 impl Default for Config {
@@ -849,6 +1006,8 @@ impl Default for Config {
             beam: 16,
             nbest: 8,
             lm_weight: 2.0,
+            record_input: None,
+            replay_input: None,
         }
     }
 }
@@ -1064,6 +1223,11 @@ fn usage_exit() -> ! {
         "usage: ecriture-rs [--pth FICHIER] [--repo owner/name] [--input-h N] [--input-w N]\n\
          \x20         [--norm 01|neg1] [--tablet-device /dev/input/eventN]\n\
          \x20         [--lexicon PATH|none] [--beam N] [--nbest N] [--lm-weight F]\n\
+         \x20         [--record-input events.jsonl] [--replay-input events.jsonl]\n\
+         --record-input FICHIER : enregistre tous les événements d'input (souris,\n\
+         \x20         touch, tablette evdev) en JSONL pendant la session.\n\
+         --replay-input FICHIER : rejoue un enregistrement en headless (sans fenêtre,\n\
+         \x20         modèle simulé) et affiche les strokes produits (rejouer un bug en CI).\n\
          défauts: --repo Sachin-0001/crnn-iam-handwriting (téléchargé via Hugging Face),\n\
          \x20         --input-h depuis config.json, --norm neg1, --lexicon embarqué (français),\n\
          \x20         --beam 16, --nbest 8, --lm-weight 2.0,\n\
@@ -1143,6 +1307,12 @@ fn parse_args() -> Config {
                     .and_then(|v| v.parse().ok())
                     .unwrap_or_else(|| usage_exit())
             }
+            "--record-input" => {
+                cfg.record_input = Some(args.next().unwrap_or_else(|| usage_exit()))
+            }
+            "--replay-input" => {
+                cfg.replay_input = Some(args.next().unwrap_or_else(|| usage_exit()))
+            }
             "-h" | "--help" => usage_exit(),
             other => {
                 eprintln!("argument inconnu: {other}");
@@ -1155,6 +1325,13 @@ fn parse_args() -> Config {
 
 fn main() -> eframe::Result<()> {
     let cfg = parse_args();
+
+    // --replay-input : rejoue un enregistrement d'input en headless et quitte
+    // (pas de fenêtre, pas de modèle téléchargé : reconnaissance simulée).
+    if let Some(path) = &cfg.replay_input {
+        return run_replay(path, &cfg)
+            .map_err(|e| eframe::Error::AppCreation(format!("{e:#}").into()));
+    }
 
     // Lexique de langue pour le rescoring N-best : embarqué (français) par
     // défaut, fichier local avec --lexicon PATH, désactivé avec --lexicon none.
@@ -1776,5 +1953,148 @@ mod tests {
             "points={}",
             app.strokes[0].points.len()
         );
+    }
+
+    // ---- Record / replay d'input (--record-input / --replay-input) ----
+
+    fn raw_frame(t: f64, events: Vec<egui::Event>) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            time: Some(t),
+            events,
+            ..Default::default()
+        }
+    }
+
+    fn tmp_record_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("ecriture-rs-{tag}-{}.jsonl", std::process::id()))
+    }
+
+    /// Un scénario souris enregistré via ui_inner (clic-maintient-relâche)
+    /// doit produire exactement le même stroke en replay headless.
+    #[test]
+    fn record_puis_replay_reproduit_les_strokes_souris() {
+        let ctx = egui::Context::default();
+        let path = tmp_record_path("souris");
+        let _ = std::fs::remove_file(&path);
+        let mut app = app_test();
+        app.recorder = Some(std::io::BufWriter::new(std::fs::File::create(&path).unwrap()));
+        for (t, evs) in [
+            (
+                1.0,
+                vec![
+                    egui::Event::PointerMoved(egui::pos2(400.0, 300.0)),
+                    ptr_button(egui::pos2(400.0, 300.0), true),
+                ],
+            ),
+            (1.05, vec![egui::Event::PointerMoved(egui::pos2(450.0, 320.0))]),
+            (
+                1.1,
+                vec![
+                    egui::Event::PointerMoved(egui::pos2(460.0, 330.0)),
+                    ptr_button(egui::pos2(460.0, 330.0), false),
+                ],
+            ),
+        ] {
+            let mut out = ctx.run_ui(raw_frame(t, evs), |ui| app.ui_inner(ui));
+            out.textures_delta.clear();
+        }
+        app.flush_recorder();
+        drop(app);
+        let (app2, n) = replay_file(path.to_str().unwrap(), &Config::default()).unwrap();
+        assert_eq!(n, 3, "3 frames enregistrées");
+        assert_eq!(app2.strokes.len(), 1, "un stroke archivé après le clic");
+        assert!(app2.strokes[0].points.len() >= 2);
+        assert!(app2.current.is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Écrit un enregistrement de démo (clic-maintient-relâche) dans
+    /// /tmp/ecriture-rs-demo-input.jsonl pour tester le CLI :
+    /// `cargo test --bin ecriture-rs -- --ignored record_input_demo_dans_tmp`
+    /// puis `cargo run -- --replay-input /tmp/ecriture-rs-demo-input.jsonl`
+    #[test]
+    #[ignore]
+    fn record_input_demo_dans_tmp() {
+        let ctx = egui::Context::default();
+        let path = std::path::PathBuf::from("/tmp/ecriture-rs-demo-input.jsonl");
+        let mut app = app_test();
+        app.recorder = Some(std::io::BufWriter::new(std::fs::File::create(&path).unwrap()));
+        for (t, evs) in [
+            (
+                1.0,
+                vec![
+                    egui::Event::PointerMoved(egui::pos2(400.0, 300.0)),
+                    ptr_button(egui::pos2(400.0, 300.0), true),
+                ],
+            ),
+            (1.05, vec![egui::Event::PointerMoved(egui::pos2(450.0, 320.0))]),
+            (
+                1.1,
+                vec![
+                    egui::Event::PointerMoved(egui::pos2(460.0, 330.0)),
+                    ptr_button(egui::pos2(460.0, 330.0), false),
+                ],
+            ),
+        ] {
+            let mut out = ctx.run_ui(raw_frame(t, evs), |ui| app.ui_inner(ui));
+            out.textures_delta.clear();
+        }
+        app.flush_recorder();
+        eprintln!("record demo -> {}", path.display());
+    }
+
+    /// Les événements tablette evdev (qui ne passent pas par winit) doivent
+    /// aussi être enregistrés (lignes Tablet) et rejoués via le channel.
+    #[test]
+    fn record_puis_replay_reproduit_les_strokes_tablette() {
+        let ctx = egui::Context::default();
+        let path = tmp_record_path("tablette");
+        let _ = std::fs::remove_file(&path);
+        let (tx, rx) = channel();
+        let src = ModelSource::Repo("Sachin-0001/crnn-iam-handwriting".into());
+        let mut app = InkApp::with_tablet_rx(
+            Box::new(MockRecognizer),
+            "mock".to_string(),
+            model_choices(&src),
+            0,
+            Config::default(),
+            DecodeOptions::default(),
+            Some(rx),
+        );
+        app.recorder = Some(std::io::BufWriter::new(std::fs::File::create(&path).unwrap()));
+        tx.send(TabletEvent::Down {
+            x: 0.5,
+            y: 0.5,
+            pressure: 1.0,
+        })
+        .unwrap();
+        let mut out = ctx.run_ui(raw_frame(1.0, vec![]), |ui| app.ui_inner(ui));
+        out.textures_delta.clear();
+        tx.send(TabletEvent::Move {
+            x: 0.6,
+            y: 0.5,
+            pressure: 1.0,
+        })
+        .unwrap();
+        let mut out = ctx.run_ui(raw_frame(1.1, vec![]), |ui| app.ui_inner(ui));
+        out.textures_delta.clear();
+        tx.send(TabletEvent::Up).unwrap();
+        let mut out = ctx.run_ui(raw_frame(1.2, vec![]), |ui| app.ui_inner(ui));
+        out.textures_delta.clear();
+        app.flush_recorder();
+        drop(app);
+        let (app2, n) = replay_file(path.to_str().unwrap(), &Config::default()).unwrap();
+        assert_eq!(n, 6, "3 frames egui + 3 batches tablette");
+        assert_eq!(app2.strokes.len(), 1, "le stroke stylet doit être archivé");
+        assert!(
+            app2.strokes[0].points.len() >= 2,
+            "points={}",
+            app2.strokes[0].points.len()
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }

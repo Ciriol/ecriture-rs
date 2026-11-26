@@ -38,6 +38,15 @@ struct InkApp {
     recognizer: Box<dyn Recognizer>,
     /// Un touch (stylet/doigt) est actuellement actif.
     touch_active: bool,
+    /// Bouton principal de la souris réellement enfoncé. État suivi nous-mêmes
+    /// à partir des événements bruts : `pointer.any_down()` peut rester bloqué
+    /// après un contact stylet sous Wayland (le release du PointerButton émulé
+    /// n'arrive jamais), ce qui faisait tracer la souris en hover.
+    mouse_down: bool,
+    /// Temps du dernier événement Touch reçu (détecte un touch bloqué : Start sans End).
+    last_touch_event: f64,
+    /// Temps du dernier événement tablette evdev reçu (détecte un contact bloqué : Up manqué).
+    last_tablet_event: f64,
     /// Un contact stylet est actif via evdev (aucun événement winit reçu).
     tablet_active: bool,
     /// Dernière position connue d'un touch (si le backend n'émule pas la souris).
@@ -120,6 +129,9 @@ impl InkApp {
             last_draw_time: 0.0,
             recognizer,
             touch_active: false,
+            mouse_down: false,
+            last_touch_event: 0.0,
+            last_tablet_event: 0.0,
             tablet_active: false,
             last_touch_pos: None,
             debug: false,
@@ -228,17 +240,43 @@ impl InkApp {
         }
     }
 
-    /// Capture du tracé souris/touch dans le canvas. On ne se fie pas qu'à la
-    /// Response du canvas : on lit l'état global du pointer (souris, ou stylet
-    /// émulé en bouton principal) ET les événements touch bruts — un stylet
-    /// sous Wayland arrive en `Event::Touch` avec une force (pression).
+    /// Capture du tracé souris/touch dans le canvas. On lit les événements
+    /// bruts — un stylet sous Wayland arrive en `Event::Touch` avec une force
+    /// (pression) et peut aussi émettre un `PointerButton` émulé.
     ///
-    /// Souris et touch sont traités SÉPARÉMENT : la souris ne trace que si un
-    /// bouton est réellement enfoncé (`down`), donc un `touch_active` resté
-    /// bloqué (Touch Start sans End) ne fait pas tracer la souris en hover.
+    /// Souris et touch sont traités SÉPARÉMENT, et l'état du bouton souris est
+    /// suivi nous-mêmes (`mouse_down`, bouton principal uniquement) plutôt que
+    /// via `pointer.any_down()` : après un contact stylet, le release du
+    /// PointerButton émulé peut ne jamais arriver, laissant `any_down()` bloqué
+    /// à true — la souris traçait alors en continu en hover. Ici, un Touch
+    /// Start remet `mouse_down` à false, et la perte du pointeur / du focus
+    /// aussi. Un touch ou un contact evdev sans événement depuis plus d'une
+    /// seconde est considéré comme terminé (Start sans End, Up manqué).
     fn handle_pointer_input(&mut self, ui: &egui::Ui, rect: egui::Rect, now: f64) {
-        let (mut touch_started, mut touch_ended, mut pressure, mut touch_pos) =
-            (false, false, 1.0f32, None);
+        let (mut touch_started, mut touch_ended, mut touch_moved, mut pressure, mut touch_pos) =
+            (false, false, false, 1.0f32, None);
+        let (btn_pressed, btn_released, pointer_gone, pointer_pos, focused) =
+            ui.input(|i| {
+                let mut bp = false;
+                let mut br = false;
+                let mut gone = false;
+                for ev in &i.events {
+                    match ev {
+                        egui::Event::PointerButton {
+                            button, pressed, ..
+                        } if *button == egui::PointerButton::Primary => {
+                            if *pressed {
+                                bp = true;
+                            } else {
+                                br = true;
+                            }
+                        }
+                        egui::Event::PointerGone => gone = true,
+                        _ => {}
+                    }
+                }
+                (bp, br, gone, i.pointer.latest_pos(), i.focused)
+            });
         ui.input(|i| {
             for ev in &i.events {
                 if let egui::Event::Touch { phase, pos, force, .. } = ev {
@@ -248,6 +286,7 @@ impl InkApp {
                             touch_pos = Some(*pos);
                         }
                         egui::TouchPhase::Move => {
+                            touch_moved = true;
                             touch_pos = Some(*pos);
                         }
                         egui::TouchPhase::End | egui::TouchPhase::Cancel => {
@@ -260,8 +299,18 @@ impl InkApp {
                 }
             }
         });
+
+        // --- Mise à jour de l'état touch ---
         if touch_started {
             self.touch_active = true;
+            // Un contact tactile n'est pas un clic souris : sous Wayland, le
+            // stylet émet parfois un PointerButton pressé dont le release
+            // n'arrive jamais ; ne jamais prendre ce `down` pour la souris.
+            self.mouse_down = false;
+            self.last_touch_event = now;
+        }
+        if touch_moved || touch_ended {
+            self.last_touch_event = now;
         }
         if let Some(p) = touch_pos {
             self.last_touch_pos = Some(p);
@@ -270,30 +319,57 @@ impl InkApp {
             self.touch_active = false;
             self.last_touch_pos = None;
         }
+        // Sécurité : un touch sans aucun événement depuis > 1 s est un touch
+        // resté bloqué (Start sans End) -> on le termine et on archive le stroke.
+        if self.touch_active && now - self.last_touch_event > 1.0 {
+            self.touch_active = false;
+            self.last_touch_pos = None;
+            if !self.mouse_down && !self.tablet_active {
+                self.end_stroke(now);
+            }
+        }
+        // Idem pour un contact tablette evdev dont le Up aurait été manqué.
+        if self.tablet_active && now - self.last_tablet_event > 1.0 {
+            self.tablet_active = false;
+            if !self.mouse_down && !self.touch_active {
+                self.end_stroke(now);
+            }
+        }
 
-        let (pressed, down, released, pointer_pos) = ui.input(|i| {
-            let p = &i.pointer;
-            (p.any_pressed(), p.any_down(), p.any_released(), p.latest_pos())
-        });
+        // --- Mise à jour de l'état bouton principal de la souris ---
+        if btn_pressed && !touch_started && !self.touch_active {
+            self.mouse_down = true;
+        }
+        if btn_released {
+            self.mouse_down = false;
+        }
+        // Le pointeur a quitté la fenêtre ou la fenêtre a perdu le focus : un
+        // bouton encore "down" chez egui est un résidu (release hors fenêtre) ->
+        // on arrête de tracer.
+        if pointer_gone || !focused {
+            self.mouse_down = false;
+        }
 
-        // Démarre un stroke uniquement sur un vrai début d'input (bouton
-        // pressé ou touch start) avec le pointeur dans le canvas.
+        // Démarre un stroke uniquement sur un vrai début d'input (clic souris
+        // ou touch start) avec le pointeur dans le canvas.
+        let mouse_pressed = btn_pressed && self.mouse_down;
         let start_pos = touch_pos.or(pointer_pos);
-        if (pressed || touch_started) && start_pos.map(|p| rect.contains(p)).unwrap_or(false) {
+        if (mouse_pressed || touch_started) && start_pos.map(|p| rect.contains(p)).unwrap_or(false) {
             self.current = Some(Stroke::new());
         }
 
-        // Souris : tracer UNIQUEMENT si un bouton est réellement enfoncé.
-        if down && !touch_ended {
+        // Souris : tracer UNIQUEMENT si le bouton principal est réellement enfoncé.
+        if self.mouse_down && !touch_ended {
             if let Some(p) = pointer_pos {
                 if rect.contains(p) {
-                    self.push_point(p, pressure, now, rect);
+                    self.push_point(p, 1.0, now, rect);
                 }
             }
         }
-        // Touch / stylet : tracer tant que le contact est actif.
+        // Touch / stylet : tracer uniquement sur les événements touch reçus
+        // dans cette frame (pas de point fantôme si le touch est bloqué).
         if self.touch_active && !touch_ended {
-            if let Some(p) = touch_pos.or(self.last_touch_pos) {
+            if let Some(p) = touch_pos {
                 if rect.contains(p) {
                     self.push_point(p, pressure, now, rect);
                 }
@@ -302,8 +378,11 @@ impl InkApp {
         // Termine le stroke sur relâchement / fin de touch, ou si plus aucun
         // input n'est actif (évite un stroke fantôme bloqué). Le contact
         // tablette lu via evdev compte aussi : winit ne lui remonte aucun
-        // événement, donc down/touch_active restent faux pendant le tracé.
-        if released || touch_ended || (!down && !self.touch_active && !self.tablet_active) {
+        // événement, donc mouse_down/touch_active restent faux pendant le tracé.
+        if btn_released
+            || touch_ended
+            || (!self.mouse_down && !self.touch_active && !self.tablet_active)
+        {
             self.end_stroke(now);
         }
     }
@@ -321,6 +400,7 @@ impl InkApp {
         if tablet_events.is_empty() {
             return;
         }
+        self.last_tablet_event = now;
         let screen = ctx.viewport_rect();
         for ev in tablet_events {
             self.tablet_count += 1;
@@ -599,12 +679,15 @@ impl InkApp {
                         })
                         .collect();
                     format!(
-                        "down={} pressed={} released={} any_touches={} pos={:?}\n{}",
+                        "down={} pressed={} released={} any_touches={} pos={:?} mouse_down={} touch_active={} tablet_active={}\n{}",
                         i.pointer.any_down(),
                         i.pointer.any_pressed(),
                         i.pointer.any_released(),
                         i.any_touches(),
                         i.pointer.latest_pos(),
+                        self.mouse_down,
+                        self.touch_active,
+                        self.tablet_active,
                         evs.join("\n")
                     )
                 });
@@ -1243,12 +1326,17 @@ mod tests {
     /// Simule une frame egui avec les événements d'input donnés, comme le
     /// fait le CentralPanel de l'app.
     fn run_frame(app: &mut InkApp, ctx: &egui::Context, events: Vec<egui::Event>) {
+        run_frame_t(app, ctx, 1.0, events);
+    }
+
+    /// Idem avec un temps explicite (les timeouts touch/tablette dépendent du temps).
+    fn run_frame_t(app: &mut InkApp, ctx: &egui::Context, time: f64, events: Vec<egui::Event>) {
         let raw = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
                 egui::vec2(800.0, 600.0),
             )),
-            time: Some(1.0),
+            time: Some(time),
             events,
             ..Default::default()
         };
@@ -1398,6 +1486,119 @@ mod tests {
             export_inkml_to(std::path::Path::new("/tmp/ecriture-rs-demo"), &[s], "démo & <test>")
                 .unwrap();
         eprintln!("inkml demo -> {}", path.display());
+    }
+
+    /// Bug réel (Wayland) : après un contact stylet, winit envoie Touch Start
+    /// (+ parfois un PointerButton pressé émulé) mais le End / le release
+    /// peuvent ne jamais arriver. `pointer.any_down()` reste alors bloqué à
+    /// true et la souris traçait en continu en hover. Le tracé souris doit
+    /// reposer sur un vrai clic (press) de la souris, et le touch bloqué doit
+    /// être terminé automatiquement.
+    #[test]
+    fn apres_stylet_la_souris_ne_trace_plus_en_hover() {
+        let ctx = egui::Context::default();
+        let mut app = app_test();
+        // Frame 1 (t=1.0) : le stylet touche l'écran -> Touch Start + PointerButton
+        // pressé émulé dans la même frame.
+        run_frame_t(
+            &mut app,
+            &ctx,
+            1.0,
+            vec![
+                touch_event(egui::TouchPhase::Start, egui::pos2(400.0, 300.0)),
+                ptr_button(egui::pos2(400.0, 300.0), true),
+            ],
+        );
+        assert!(app.current.is_some(), "le touch start doit créer un stroke");
+        assert!(
+            !app.mouse_down,
+            "le contact stylet ne doit pas activer le tracé souris"
+        );
+        // Frame 2 (t=1.1) : le release du stylet n'arrive jamais ; la souris
+        // bouge en hover -> aucun point ne doit être ajouté au stroke.
+        run_frame_t(
+            &mut app,
+            &ctx,
+            1.1,
+            vec![egui::Event::PointerMoved(egui::pos2(600.0, 500.0))],
+        );
+        let n = app.current.as_ref().map(|s| s.points.len()).unwrap_or(0);
+        assert_eq!(
+            n, 1,
+            "la souris a tracé en hover après le stylet (points={n})"
+        );
+        // Frame 3 (t=3.0) : le touch bloqué est périmé (> 1 s sans événement),
+        // puis un vrai clic souris démarre un nouveau stroke.
+        run_frame_t(
+            &mut app,
+            &ctx,
+            3.0,
+            vec![
+                egui::Event::PointerMoved(egui::pos2(500.0, 400.0)),
+                ptr_button(egui::pos2(500.0, 400.0), true),
+            ],
+        );
+        assert!(app.mouse_down, "le vrai clic souris doit activer mouse_down");
+        assert!(!app.touch_active, "le touch bloqué doit être terminé");
+        assert_eq!(app.strokes.len(), 1, "le stroke du stylet doit être archivé");
+        // Frame 4 : maintient du clic, la souris trace.
+        run_frame_t(
+            &mut app,
+            &ctx,
+            3.1,
+            vec![egui::Event::PointerMoved(egui::pos2(550.0, 420.0))],
+        );
+        let pts = app.current.as_ref().map(|s| s.points.len());
+        assert!(
+            pts.unwrap_or(0) >= 2,
+            "pas de tracé pendant le clic-maintient (points={pts:?})"
+        );
+        // Frame 5 : relâchement -> le stroke souris est archivé.
+        run_frame_t(
+            &mut app,
+            &ctx,
+            3.2,
+            vec![ptr_button(egui::pos2(550.0, 420.0), false)],
+        );
+        assert!(app.current.is_none(), "le stroke doit être fermé au release");
+        assert_eq!(app.strokes.len(), 2);
+        // Frame 6 : hover après le relâchement -> rien ne se passe.
+        run_frame_t(
+            &mut app,
+            &ctx,
+            3.3,
+            vec![egui::Event::PointerMoved(egui::pos2(700.0, 550.0))],
+        );
+        assert!(app.current.is_none() && app.strokes.len() == 2);
+    }
+
+    /// Le pointeur quitte la fenêtre avec le bouton enfoncé (release hors
+    /// fenêtre, non reçu) : au retour en hover, la souris ne doit pas tracer.
+    #[test]
+    fn release_hors_fenetre_ne_laisse_pas_de_trace_continue() {
+        let ctx = egui::Context::default();
+        let mut app = app_test();
+        run_frame(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(egui::pos2(400.0, 300.0)),
+                ptr_button(egui::pos2(400.0, 300.0), true),
+            ],
+        );
+        assert!(app.mouse_down && app.current.is_some());
+        // Le curseur quitte la fenêtre (bouton encore enfoncé) : egui ne voit
+        // pas le release, any_down() reste true, mais on coupe mouse_down.
+        run_frame(&mut app, &ctx, vec![egui::Event::PointerGone]);
+        assert!(!app.mouse_down, "PointerGone doit couper mouse_down");
+        // Retour en hover dans le canvas : aucun point ajouté.
+        run_frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerMoved(egui::pos2(500.0, 400.0))],
+        );
+        assert!(app.current.is_none(), "le stroke aurait dû être fermé");
+        assert!(app.strokes.len() <= 1);
     }
 
     #[test]

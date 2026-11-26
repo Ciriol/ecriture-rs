@@ -38,6 +38,8 @@ struct InkApp {
     recognizer: Box<dyn Recognizer>,
     /// Un touch (stylet/doigt) est actuellement actif.
     touch_active: bool,
+    /// Un contact stylet est actif via evdev (aucun événement winit reçu).
+    tablet_active: bool,
     /// Dernière position connue d'un touch (si le backend n'émule pas la souris).
     last_touch_pos: Option<egui::Pos2>,
     /// Mode debug : affiche les événements d'entrée reçus.
@@ -118,6 +120,7 @@ impl InkApp {
             last_draw_time: 0.0,
             recognizer,
             touch_active: false,
+            tablet_active: false,
             last_touch_pos: None,
             debug: false,
             debug_info: String::new(),
@@ -297,9 +300,50 @@ impl InkApp {
             }
         }
         // Termine le stroke sur relâchement / fin de touch, ou si plus aucun
-        // input n'est actif (évite un stroke fantôme bloqué).
-        if released || touch_ended || (!down && !self.touch_active) {
+        // input n'est actif (évite un stroke fantôme bloqué). Le contact
+        // tablette lu via evdev compte aussi : winit ne lui remonte aucun
+        // événement, donc down/touch_active restent faux pendant le tracé.
+        if released || touch_ended || (!down && !self.touch_active && !self.tablet_active) {
             self.end_stroke(now);
+        }
+    }
+
+    /// Tracé au stylet lu directement via evdev (winit ne remonte pas
+    /// toujours le périphérique à egui). Coordonnées normalisées 0..1
+    /// de l'écran -> points UI via le viewport_rect.
+    fn handle_tablet_events(&mut self, ctx: &egui::Context, rect: egui::Rect, now: f64) {
+        let mut tablet_events = Vec::new();
+        if let Some(rx) = &self.tablet_rx {
+            while let Ok(ev) = rx.try_recv() {
+                tablet_events.push(ev);
+            }
+        }
+        if tablet_events.is_empty() {
+            return;
+        }
+        let screen = ctx.viewport_rect();
+        for ev in tablet_events {
+            self.tablet_count += 1;
+            match ev {
+                TabletEvent::Down { x, y, pressure } => {
+                    let p = egui::pos2(x * screen.width(), y * screen.height());
+                    if rect.contains(p) {
+                        self.current = Some(Stroke::new());
+                        self.tablet_active = true;
+                        self.push_point(p, pressure, now, rect);
+                    }
+                }
+                TabletEvent::Move { x, y, pressure } => {
+                    let p = egui::pos2(x * screen.width(), y * screen.height());
+                    if rect.contains(p) {
+                        self.push_point(p, pressure, now, rect);
+                    }
+                }
+                TabletEvent::Up => {
+                    self.tablet_active = false;
+                    self.end_stroke(now);
+                }
+            }
         }
     }
 
@@ -363,6 +407,14 @@ impl InkApp {
 
 impl eframe::App for InkApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.ui_inner(ui);
+    }
+}
+
+impl InkApp {
+    /// Contenu complet de la fenêtre (extrait de `eframe::App::ui` pour être
+    /// appelable dans un `egui::Context` de test).
+    fn ui_inner(&mut self, ui: &mut egui::Ui) {
         // Modèle chargé en arrière-plan : on bascule dessus.
         let loaded = self.model_rx.as_ref().and_then(|rx| rx.try_recv().ok());
         if let Some((rec, desc)) = loaded {
@@ -520,38 +572,8 @@ impl eframe::App for InkApp {
             self.handle_pointer_input(ui, rect, now);
 
             // Tracé au stylet lu directement via evdev (winit ne remonte pas
-            // toujours le périphérique à egui). Coordonnées normalisées 0..1
-            // de l'écran -> points UI via le screen_rect.
-            let mut tablet_events = Vec::new();
-            if let Some(rx) = &self.tablet_rx {
-                while let Ok(ev) = rx.try_recv() {
-                    tablet_events.push(ev);
-                }
-            }
-            if !tablet_events.is_empty() {
-                let screen = ui.ctx().viewport_rect();
-                for ev in tablet_events {
-                    self.tablet_count += 1;
-                    match ev {
-                        TabletEvent::Down { x, y, pressure } => {
-                            let p = egui::pos2(x * screen.width(), y * screen.height());
-                            if rect.contains(p) {
-                                self.current = Some(Stroke::new());
-                                self.push_point(p, pressure, now, rect);
-                            }
-                        }
-                        TabletEvent::Move { x, y, pressure } => {
-                            let p = egui::pos2(x * screen.width(), y * screen.height());
-                            if rect.contains(p) {
-                                self.push_point(p, pressure, now, rect);
-                            }
-                        }
-                        TabletEvent::Up => {
-                            self.end_stroke(now);
-                        }
-                    }
-                }
-            }
+            // toujours le périphérique à egui).
+            self.handle_tablet_events(ui.ctx(), rect, now);
 
             // Mode debug : remonte ce que egui reçoit comme entrée.
             if self.debug {
@@ -1234,7 +1256,9 @@ mod tests {
             let (response, _painter) =
                 ui.allocate_painter(ui.available_size(), egui::Sense::drag());
             let now = ui.input(|i| i.time);
-            app.handle_pointer_input(ui, response.rect, now);
+            let rect = response.rect;
+            app.handle_pointer_input(ui, rect, now);
+            app.handle_tablet_events(ui.ctx(), rect, now);
         });
         // Hors écran, personne n'applique les deltas de textures (fonts...) :
         // on les vide pour éviter le panic au drop.
@@ -1399,5 +1423,157 @@ mod tests {
             vec![egui::Event::PointerMoved(egui::pos2(600.0, 500.0))],
         );
         assert!(app.current.is_none() && app.strokes.len() == 1);
+    }
+
+    // ---- Simulation du stylet lu via evdev (channel tablette) ----
+
+    /// Reproduit le flux réel du stylet evdev : le thread de lecture envoie
+    /// Down/Move/Up dans le channel entre les frames egui, et AUCUN événement
+    /// winit n'arrive à egui pendant le tracé (d'où down=false et
+    /// touch_active=false à chaque frame). Le stroke doit rester ouvert entre
+    /// les frames et n'être archivé qu'au Up.
+    #[test]
+    fn stylet_evdev_trace_un_stroke_complet_entre_les_frames() {
+        let ctx = egui::Context::default();
+        let (tx, rx) = channel();
+        let src = ModelSource::Repo("Sachin-0001/crnn-iam-handwriting".into());
+        let mut app = InkApp::with_tablet_rx(
+            Box::new(MockRecognizer),
+            "mock".to_string(),
+            model_choices(&src),
+            0,
+            Config::default(),
+            DecodeOptions::default(),
+            Some(rx),
+        );
+        // Frame 1 : Down au centre du canvas 800x600 -> (400, 300).
+        tx.send(TabletEvent::Down {
+            x: 0.5,
+            y: 0.5,
+            pressure: 1.0,
+        })
+        .unwrap();
+        run_frame(&mut app, &ctx, vec![]);
+        assert!(app.current.is_some(), "le Down doit ouvrir un stroke");
+        assert!(app.tablet_active);
+        // Frame 2 : Move, sans aucun événement egui (stylet evdev seul).
+        tx.send(TabletEvent::Move {
+            x: 0.55,
+            y: 0.5,
+            pressure: 1.0,
+        })
+        .unwrap();
+        run_frame(&mut app, &ctx, vec![]);
+        let n = app.current.as_ref().map(|s| s.points.len());
+        assert!(
+            n.unwrap_or(0) >= 2,
+            "le stroke a été fermé prématurément après le Down (points={n:?})"
+        );
+        // Frame 3 : Move puis Up -> le stroke est archivé avec tous ses points.
+        tx.send(TabletEvent::Move {
+            x: 0.6,
+            y: 0.55,
+            pressure: 1.0,
+        })
+        .unwrap();
+        tx.send(TabletEvent::Up).unwrap();
+        run_frame(&mut app, &ctx, vec![]);
+        assert!(app.current.is_none(), "le Up doit fermer le stroke");
+        assert!(!app.tablet_active);
+        assert_eq!(app.strokes.len(), 1);
+        assert!(
+            app.strokes[0].points.len() >= 3,
+            "points={}",
+            app.strokes[0].points.len()
+        );
+    }
+
+    /// Test d'intégration : fait tourner le VRAI ui complet de l'app
+    /// (`ui_inner`) dans un egui::Context, avec un channel tablette alimenté
+    /// entre les frames (Down/Move/Up) et aucun événement winit — comme avec
+    /// un vrai stylet lu en evdev. Vérifie que la trace est réellement rendue
+    /// (lignes noires dans les shapes de sortie) pendant ET après le stroke.
+    #[test]
+    fn ui_complete_rend_la_trace_du_stylet_evdev() {
+        let ctx = egui::Context::default();
+        let (tx, rx) = channel();
+        let src = ModelSource::Repo("Sachin-0001/crnn-iam-handwriting".into());
+        let mut app = InkApp::with_tablet_rx(
+            Box::new(MockRecognizer),
+            "mock".to_string(),
+            model_choices(&src),
+            0,
+            Config::default(),
+            DecodeOptions::default(),
+            Some(rx),
+        );
+        let raw = |t: f64| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            time: Some(t),
+            ..Default::default()
+        };
+        let lignes_noires = |out: &egui::FullOutput| {
+            out.shapes
+                .iter()
+                .filter(|cs| {
+                    matches!(&cs.shape, egui::Shape::Path(p) if p.stroke.color == egui::epaint::ColorMode::Solid(egui::Color32::BLACK))
+                })
+                .count()
+        };
+
+        // Frame 1 : Down au centre (0.5, 0.5) -> (400, 300) dans le canvas.
+        tx.send(TabletEvent::Down {
+            x: 0.5,
+            y: 0.5,
+            pressure: 1.0,
+        })
+        .unwrap();
+        let mut out = ctx.run_ui(raw(1.0), |ui| app.ui_inner(ui));
+        out.textures_delta.clear();
+
+        // Frame 2 : une série de Moves, sans aucun événement egui (stylet evdev).
+        for i in 1..=10 {
+            tx.send(TabletEvent::Move {
+                x: 0.5 + 0.02 * i as f32,
+                y: 0.5,
+                pressure: 1.0,
+            })
+            .unwrap();
+        }
+        let mut out = ctx.run_ui(raw(1.1), |ui| app.ui_inner(ui));
+        out.textures_delta.clear();
+        let pts = app.current.as_ref().map(|s| s.points.len());
+        assert!(
+            pts.unwrap_or(0) >= 10,
+            "le stroke en cours a perdu des points (points={pts:?})"
+        );
+
+        // Frame 3 : aucun nouvel événement -> le rendu affiche enfin les points
+        // reçus à la frame 2 (le dessin précède le traitement de l'input).
+        let mut out = ctx.run_ui(raw(1.2), |ui| app.ui_inner(ui));
+        let n = lignes_noires(&out);
+        out.textures_delta.clear();
+        assert!(
+            n >= 1,
+            "aucune ligne noire rendue pendant le tracé stylet (n={n})"
+        );
+
+        // Frame 4 : Up -> le stroke est archivé mais la trace reste affichée.
+        tx.send(TabletEvent::Up).unwrap();
+        let mut out = ctx.run_ui(raw(1.3), |ui| app.ui_inner(ui));
+        out.textures_delta.clear();
+        let mut out = ctx.run_ui(raw(1.4), |ui| app.ui_inner(ui));
+        let n = lignes_noires(&out);
+        out.textures_delta.clear();
+        assert!(n >= 1, "la trace doit rester affichée après le Up (n={n})");
+        assert_eq!(app.strokes.len(), 1);
+        assert!(
+            app.strokes[0].points.len() >= 10,
+            "points={}",
+            app.strokes[0].points.len()
+        );
     }
 }

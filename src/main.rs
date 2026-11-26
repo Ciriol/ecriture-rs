@@ -551,7 +551,7 @@ impl eframe::App for InkApp {
         self.ui_inner(ui);
     }
 
-    fn on_exit(&mut self) {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.flush_recorder();
     }
 }
@@ -989,6 +989,17 @@ struct Config {
     /// Rejoue un fichier --record-input en mode headless (sans fenêtre) et
     /// affiche le résumé des strokes produits.
     replay_input: Option<String>,
+    /// Backend de rendu : wgpu (Vulkan, défaut) ou glow (OpenGL, recommandé
+    /// sur les vieux iGPU Intel Haswell où le support Vulkan de Mesa est
+    /// incomplet -> warning + risques de crash).
+    renderer: RendererChoice,
+}
+
+/// Backend de rendu egui/eframe choisi en CLI.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RendererChoice {
+    Wgpu,
+    Glow,
 }
 
 impl Default for Config {
@@ -1008,6 +1019,7 @@ impl Default for Config {
             lm_weight: 2.0,
             record_input: None,
             replay_input: None,
+            renderer: RendererChoice::Wgpu,
         }
     }
 }
@@ -1228,6 +1240,9 @@ fn usage_exit() -> ! {
          \x20         touch, tablette evdev) en JSONL pendant la session.\n\
          --replay-input FICHIER : rejoue un enregistrement en headless (sans fenêtre,\n\
          \x20         modèle simulé) et affiche les strokes produits (rejouer un bug en CI).\n\
+         --renderer glow|wgpu : backend de rendu (défaut wgpu/Vulkan ; glow=OpenGL,\n\
+         \x20         recommandé sur vieux iGPU Intel Haswell où Mesa Vulkan est\n\
+         \x20         incomplet -> warning + crashs ; env ECRITURE_RENDERER=glow).\n\
          défauts: --repo Sachin-0001/crnn-iam-handwriting (téléchargé via Hugging Face),\n\
          \x20         --input-h depuis config.json, --norm neg1, --lexicon embarqué (français),\n\
          \x20         --beam 16, --nbest 8, --lm-weight 2.0,\n\
@@ -1257,6 +1272,7 @@ fn usage_exit() -> ! {
 
 fn parse_args() -> Config {
     let mut cfg = Config::default();
+    let mut renderer_set = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -1313,10 +1329,28 @@ fn parse_args() -> Config {
             "--replay-input" => {
                 cfg.replay_input = Some(args.next().unwrap_or_else(|| usage_exit()))
             }
+            "--renderer" => {
+                cfg.renderer = match args.next().as_deref() {
+                    Some("glow") => RendererChoice::Glow,
+                    Some("wgpu") => RendererChoice::Wgpu,
+                    _ => usage_exit(),
+                };
+                renderer_set = true;
+            }
             "-h" | "--help" => usage_exit(),
             other => {
                 eprintln!("argument inconnu: {other}");
                 usage_exit();
+            }
+        }
+    }
+    // --renderer a priorité ; sinon variable d'env ECRITURE_RENDERER=glow|wgpu.
+    if !renderer_set {
+        if let Ok(r) = std::env::var("ECRITURE_RENDERER") {
+            match r.as_str() {
+                "glow" => cfg.renderer = RendererChoice::Glow,
+                "wgpu" => cfg.renderer = RendererChoice::Wgpu,
+                _ => eprintln!("ECRITURE_RENDERER={r} invalide (glow|wgpu), ignoré"),
             }
         }
     }
@@ -1380,7 +1414,16 @@ fn main() -> eframe::Result<()> {
     let model_sources = model_choices(&src);
     let model_index = model_sources.iter().position(|s| s == &src).unwrap_or(0);
 
+    // Backend de rendu : wgpu (Vulkan) par défaut ; glow (OpenGL) sur les vieux
+    // iGPU Intel (Haswell) où Mesa Vulkan est incomplet (--renderer glow ou
+    // ECRITURE_RENDERER=glow).
+    let renderer = match cfg.renderer {
+        RendererChoice::Wgpu => eframe::Renderer::Wgpu,
+        RendererChoice::Glow => eframe::Renderer::Glow,
+    };
+    eprintln!("renderer: {}", renderer);
     let options = eframe::NativeOptions {
+        renderer,
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1100.0, 800.0])
             .with_min_inner_size([720.0, 520.0]),

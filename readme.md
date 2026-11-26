@@ -58,6 +58,7 @@ Priorité de résolution : `--pth` > `--weights-url` > `--weights-dir` > auto-lo
 | `--input-h N` | `image_height` du config.json (32) | hauteur de redimensionnement de l'image d'entrée. Toute valeur ≥ 32 fonctionne avec le CRNN (pool vertical adaptatif en fin de CNN) ; 32 = défaut du modèle IAM |
 | `--norm 01\|neg1` | `neg1` | normalisation des pixels : `01` = 0..1 (blanc=1), `neg1` = -1..1 |
 | `--tablet-device /dev/input/eventN` | auto-détection | périphérique tablette forcé (ou env `ECRITURE_TABLET_DEVICE`) |
+| `--renderer glow\|wgpu` | `wgpu` (Vulkan) | backend de rendu eframe. Sur les vieux iGPU Intel (Haswell), Mesa Vulkan est incomplet (`MESA-INTEL: warning: Haswell Vulkan support is incomplete`, risques de crash) : utiliser `--renderer glow` (OpenGL), ou env `ECRITURE_RENDERER=glow` |
 | `--lexicon PATH\|none` | lexique français embarqué (`assets/lexique-fr.txt`) | fichier "1 mot par ligne" pour le rescoring N-best ; `none` désactive le lexique |
 | `--beam N` | `16` | largeur du beam search CTC (`1` = décodage glouton) |
 | `--nbest N` | `8` | nombre d'hypothèses N-best rescorées par le lexique |

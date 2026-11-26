@@ -160,8 +160,19 @@ pilotés par un fichier scénario :
 
 ```bash
 cargo run --release --bin uinput-pilot -- tools/scenario-stylet-puis-souris.txt
-# commandes : screen W H | mouse | pen | mmove dx dy | mdown/mup/mclick |
-#             pmove x y | pdown [p] | pup | sleep ms   (# = commentaire)
+# ou mode interactif (lit les commandes sur stdin, devices persistants) :
+cargo run --release --bin uinput-pilot -- -
+# commandes : screen W H | mouse | amouse | pen |
+#   mmove dx dy | mdown/mup/mclick            (souris relative)
+#   amove x y | adown/aup                     (souris ABSOLUE : positionne le
+#                                              curseur exactement, utile sous
+#                                              Wayland où wl_pointer.motion n'est
+#                                              envoyé que si le curseur est sur
+#                                              la fenêtre)
+#   pmove x y | pdown [p] | pup               (stylet : contact BTN_TOUCH)
+#   phover x y [p] | pleave                   (proximité stylet, pression sans
+#                                              BTN_TOUCH : ne doit pas tracer)
+#   sleep ms                                  (# = commentaire)
 ```
 
 Combiner les deux : lancer l'app avec `--record-input`, injecter un scénario

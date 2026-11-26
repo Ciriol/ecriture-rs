@@ -14,7 +14,13 @@
 //! Format du scénario (une commande par ligne, `#` = commentaire) :
 //!   screen W H      résolution de l'écran en pixels (défaut 1920x1080),
 //!                   utilisée pour les coordonnées absolues du stylet
-//!   mouse           crée la souris virtuelle (REL_X/REL_Y + BTN_LEFT/RIGHT/MIDDLE)
+//!   mouse           crée la souris virtuelle relative (REL_X/REL_Y + BTN_LEFT/RIGHT/MIDDLE)
+//!   amouse          crée une souris ABSOLUE (ABS_X/Y + BTN_LEFT) : le curseur va
+//!                   exactement aux coordonnées demandées (utile sous Wayland, où
+//!                   wl_pointer.motion n'est envoyé que si le curseur est sur la
+//!                   fenêtre cible) ; PAS de BTN_TOUCH -> pas lu en evdev par l'app
+//!   amove x y       déplace le curseur (pixels écran)
+//!   adown / aup     bouton gauche de la souris absolue
 //!   pen             crée le stylet virtuel (ABS_X/ABS_Y/ABS_PRESSURE + BTN_TOUCH
 //!                   + BTN_TOOL_PEN, comme un vrai stylet Wacom)
 //!   mmove dx dy     mouvement relatif de la souris
@@ -48,9 +54,23 @@ enum Cmd {
     MDown,
     MUp,
     MClick,
+    /// Crée une souris ABSOLUE (ABS_X/Y + BTN_LEFT) : libinput la traite comme
+    /// pointeur absolu, le curseur va exactement aux coordonnées demandées
+    /// (indispensable sous Wayland, où wl_pointer.motion n'est envoyé que
+    /// si le curseur est sur la fenêtre cible).
+    AMouse,
+    /// Déplace le curseur aux coordonnées écran (pixels).
+    AMove(i32, i32),
+    ADown,
+    AUp,
     PMove(i32, i32),
     PDown(f32),
     PUp,
+    /// Proximité du stylet SANS contact : BTN_TOOL_PEN=1 + ABS_PRESSURE=p,
+    /// mais PAS de BTN_TOUCH (comportement d'un vrai Wacom en hover proche).
+    PHover(i32, i32, f32),
+    /// Sortie de proximité du stylet.
+    PLeave,
     Sleep(u64),
 }
 
@@ -94,6 +114,20 @@ fn parse_scenario(text: &str) -> Result<Vec<Cmd>, String> {
             "mdown" => Cmd::MDown,
             "mup" => Cmd::MUp,
             "mclick" => Cmd::MClick,
+            "amouse" => Cmd::AMouse,
+            "amove" => {
+                let x = words
+                    .get(1)
+                    .and_then(|v| v.parse().ok())
+                    .ok_or_else(|| err("amove attend x y (pixels écran)"))?;
+                let y = words
+                    .get(2)
+                    .and_then(|v| v.parse().ok())
+                    .ok_or_else(|| err("amove attend x y (pixels écran)"))?;
+                Cmd::AMove(x, y)
+            }
+            "adown" => Cmd::ADown,
+            "aup" => Cmd::AUp,
             "pmove" => {
                 let x = words
                     .get(1)
@@ -114,6 +148,23 @@ fn parse_scenario(text: &str) -> Result<Vec<Cmd>, String> {
                 Cmd::PDown(p)
             }
             "pup" => Cmd::PUp,
+            "phover" => {
+                let x = words
+                    .get(1)
+                    .and_then(|v| v.parse().ok())
+                    .ok_or_else(|| err("phover attend x y [p]"))?;
+                let y = words
+                    .get(2)
+                    .and_then(|v| v.parse().ok())
+                    .ok_or_else(|| err("phover attend x y [p]"))?;
+                let p = words
+                    .get(3)
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0.3f32)
+                    .clamp(0.0, 1.0);
+                Cmd::PHover(x, y, p)
+            }
+            "pleave" => Cmd::PLeave,
             "sleep" => {
                 let ms = words
                     .get(1)
@@ -161,6 +212,7 @@ fn emit(dev: &mut VirtualDevice, mut evs: Vec<InputEvent>) -> std::io::Result<()
 /// Le pilote : détient les devices virtuels créés et exécute les commandes.
 struct Pilot {
     mouse: Option<VirtualDevice>,
+    amouse: Option<VirtualDevice>,
     pen: Option<VirtualDevice>,
     screen: (i32, i32),
     pen_pos: (i32, i32),
@@ -172,12 +224,40 @@ impl Pilot {
     fn new() -> Self {
         Self {
             mouse: None,
+            amouse: None,
             pen: None,
             screen: (1920, 1080),
             pen_pos: (0, 0),
             pen_down: false,
             pen_pressure: 0.0,
         }
+    }
+
+    /// Crée une souris absolue (ABS_X/Y bornés à l'écran + BTN_LEFT) : libinput
+    /// la classe en pointeur absolu, le curseur va exactement où on demande.
+    /// (Contrairement au stylet, PAS de BTN_TOUCH/BTN_TOOL_PEN : l'app ne la
+    /// lit donc pas en evdev, elle ne passe que par winit.)
+    fn create_amouse(&mut self) -> std::io::Result<()> {
+        let (w, h) = self.screen;
+        let abs_x = UinputAbsSetup::new(
+            AbsoluteAxisCode::ABS_X,
+            AbsInfo::new(0, 0, w - 1, 0, 0, 0),
+        );
+        let abs_y = UinputAbsSetup::new(
+            AbsoluteAxisCode::ABS_Y,
+            AbsInfo::new(0, 0, h - 1, 0, 0, 0),
+        );
+        let keys = AttributeSet::from_iter([KeyCode::BTN_LEFT]);
+        let dev = VirtualDevice::builder()?
+            .name("vibe-pilot-amouse")
+            .input_id(InputId::new(BusType::BUS_USB, 0x16c0, 0x05df, 3))
+            .with_absolute_axis(&abs_x)?
+            .with_absolute_axis(&abs_y)?
+            .with_keys(&keys)?
+            .build()?;
+        eprintln!("uinput-pilot: souris absolue 'vibe-pilot-amouse' créée");
+        self.amouse = Some(dev);
+        Ok(())
     }
 
     /// Crée la souris virtuelle.
@@ -269,6 +349,38 @@ impl Pilot {
                 sleep(Duration::from_millis(30));
                 emit(dev, vec![key(KeyCode::BTN_LEFT, 0)]).map_err(|e| e.to_string())?;
             }
+            Cmd::AMouse => self.create_amouse().map_err(|e| e.to_string())?,
+            Cmd::AMove(x, y) => {
+                let (w, h) = self.screen;
+                let x = x.clamp(0, w - 1);
+                let y = y.clamp(0, h - 1);
+                let dev = self
+                    .amouse
+                    .as_mut()
+                    .ok_or("pas de souris absolue (`amouse`)")?;
+                emit(
+                    dev,
+                    vec![
+                        abs(AbsoluteAxisCode::ABS_X, x),
+                        abs(AbsoluteAxisCode::ABS_Y, y),
+                    ],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            Cmd::ADown => {
+                let dev = self
+                    .amouse
+                    .as_mut()
+                    .ok_or("pas de souris absolue (`amouse`)")?;
+                emit(dev, vec![key(KeyCode::BTN_LEFT, 1)]).map_err(|e| e.to_string())?;
+            }
+            Cmd::AUp => {
+                let dev = self
+                    .amouse
+                    .as_mut()
+                    .ok_or("pas de souris absolue (`amouse`)")?;
+                emit(dev, vec![key(KeyCode::BTN_LEFT, 0)]).map_err(|e| e.to_string())?;
+            }
             Cmd::PMove(x, y) => {
                 let (w, h) = self.screen;
                 let x = x.clamp(0, w - 1);
@@ -320,6 +432,38 @@ impl Pilot {
                 )
                 .map_err(|e| e.to_string())?;
             }
+            Cmd::PHover(x, y, p) => {
+                let (w, h) = self.screen;
+                let x = x.clamp(0, w - 1);
+                let y = y.clamp(0, h - 1);
+                self.pen_pos = (x, y);
+                self.pen_pressure = p;
+                let dev = self.pen.as_mut().ok_or("pas de stylet virtuel (`pen`)")?;
+                emit(
+                    dev,
+                    vec![
+                        key(KeyCode::BTN_TOOL_PEN, 1),
+                        abs(AbsoluteAxisCode::ABS_X, x),
+                        abs(AbsoluteAxisCode::ABS_Y, y),
+                        abs(
+                            AbsoluteAxisCode::ABS_PRESSURE,
+                            (p * PRESSURE_MAX as f32) as i32,
+                        ),
+                    ],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            Cmd::PLeave => {
+                let dev = self.pen.as_mut().ok_or("pas de stylet virtuel (`pen`)")?;
+                emit(
+                    dev,
+                    vec![
+                        abs(AbsoluteAxisCode::ABS_PRESSURE, 0),
+                        key(KeyCode::BTN_TOOL_PEN, 0),
+                    ],
+                )
+                .map_err(|e| e.to_string())?;
+            }
             Cmd::Sleep(ms) => sleep(Duration::from_millis(ms)),
         }
         Ok(())
@@ -330,8 +474,38 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 2 {
         eprintln!("usage: uinput-pilot FICHIER_SCENARIO");
+        eprintln!("       uinput-pilot -        # mode interactif : lit les commandes sur stdin, ligne par ligne");
         eprintln!("exemple: cargo run --release --bin uinput-pilot -- tools/scenario-stylet-puis-souris.txt");
         std::process::exit(2);
+    }
+    let mut pilot = Pilot::new();
+    if args[1] == "-" {
+        // Mode interactif : chaque ligne de stdin est une commande. Les devices
+        // virtuels restent ouverts tant que stdin est ouvert — permet de les
+        // créer AVANT de lancer l'app (elle ouvre alors /dev/input/event*).
+        use std::io::BufRead;
+        let stdin = std::io::stdin();
+        let mut n = 0usize;
+        for line in stdin.lock().lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => break,
+            };
+            match parse_scenario(&line) {
+                Ok(cmds) => {
+                    for cmd in cmds {
+                        if let Err(e) = pilot.exec(cmd) {
+                            eprintln!("uinput-pilot: erreur: {e}");
+                            std::process::exit(1);
+                        }
+                        n += 1;
+                    }
+                }
+                Err(e) => eprintln!("uinput-pilot: ignoré: {e}"),
+            }
+        }
+        eprintln!("uinput-pilot: fin de stdin ({n} commandes)");
+        return;
     }
     let text = match std::fs::read_to_string(&args[1]) {
         Ok(t) => t,
@@ -347,7 +521,6 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let mut pilot = Pilot::new();
     let n = cmds.len();
     for cmd in cmds {
         if let Err(e) = pilot.exec(cmd) {

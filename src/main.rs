@@ -179,17 +179,16 @@ impl InkApp {
     }
 
     /// Enregistre la frame egui courante (RawInput complet : time, screen_rect,
-    /// events...) comme une ligne JSONL.
+    /// events...) comme une ligne JSONL. Flush à chaque ligne : un kill brutal
+    /// de l'app ne doit rien perdre.
     fn record_frame(&mut self, ctx: &egui::Context) {
         use std::io::Write as _;
         if let Some(w) = &mut self.recorder {
             let raw = ctx.input(|i| i.raw.clone());
             if let Ok(line) = serde_json::to_string(&RecordedLine::Frame(raw)) {
                 let _ = writeln!(w, "{line}");
+                let _ = w.flush();
                 self.recorded_frames += 1;
-                if self.recorded_frames % 20 == 0 {
-                    let _ = w.flush();
-                }
             }
         }
     }
@@ -200,6 +199,7 @@ impl InkApp {
         if let Some(w) = &mut self.recorder {
             if let Ok(line) = serde_json::to_string(&RecordedLine::Tablet(events.to_vec())) {
                 let _ = writeln!(w, "{line}");
+                let _ = w.flush();
             }
         }
     }
@@ -1977,6 +1977,18 @@ mod tests {
     /// doit produire exactement le même stroke en replay headless.
     #[test]
     fn record_puis_replay_reproduit_les_strokes_souris() {
+        // Sanity : un RawInput avec des événements se sérialise bien en JSONL.
+        let raw = raw_frame(
+            1.0,
+            vec![egui::Event::PointerMoved(egui::pos2(10.0, 20.0))],
+        );
+        let line = serde_json::to_string(&RecordedLine::Frame(raw)).expect("serialize RawInput");
+        let back: RecordedLine = serde_json::from_str(&line).expect("deserialize RawInput");
+        match back {
+            RecordedLine::Frame(r) => assert_eq!(r.events.len(), 1),
+            _ => panic!("mauvaise variante"),
+        }
+
         let ctx = egui::Context::default();
         let path = tmp_record_path("souris");
         let _ = std::fs::remove_file(&path);

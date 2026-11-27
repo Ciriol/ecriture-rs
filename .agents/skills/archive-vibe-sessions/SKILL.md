@@ -27,9 +27,10 @@ session et avant de la terminer — sans demander de confirmation à l'utilisate
    auteur/commiter égales au `start_time` de sa session.
 5. **Push** : `git push --force-with-lease origin 'refs/heads/vibe/*'`
    (les branches réécrites par le rebase exigent le force-with-lease).
-6. **Filtrage par projet** : seules les sessions dont le cwd
-   (`meta.json` → `environment.working_directory`) est la racine du dépôt
-   sont exportées. Une session d'un autre dossier (ex. `cprn_infra`, ansible)
+6. **Filtrage par projet** : seules les sessions **en rapport avec ce projet**
+   sont exportées — celles dont le cwd (`meta.json` →
+   `environment.working_directory`) est la racine du dépôt **ou un
+   sous-dossier**. Une session d'un autre dossier (ex. `cprn_infra`, ansible)
    n'appartient pas à ce dépôt : pour la retirer, supprimer sa branche
    locale et distante (`git branch -D vibe/session-<slug>` +
    `git push origin --delete vibe/session-<slug>`), puis relancer le rebase
@@ -38,10 +39,12 @@ session et avant de la terminer — sans demander de confirmation à l'utilisate
 ## Procédure (à exécuter à chaque session)
 
 ```bash
-cd /home/lbonnier/git_projects/ecriture-rs
+cd "$(git rev-parse --show-toplevel)"   # racine du clone ecriture-rs (portable)
 git fetch --all --prune
 
-# 1) rapatrier localement les branches vibe/* distantes existantes
+# 1) rapatrier l'arbre vibe/ distant en branches locales
+#    (clone neuf : fetch direct ; sinon : branches depuis origin/vibe/*)
+git fetch origin '+refs/heads/vibe/*:refs/heads/vibe/*' 2>/dev/null
 for r in $(git for-each-ref --format='%(refname:short)' refs/remotes/origin/vibe/); do
   git branch --force "${r#origin/}" "$r" 2>/dev/null || true
 done
@@ -57,7 +60,8 @@ import json, glob, os, sys
 repo = os.getcwd()
 for d in sorted(glob.glob(os.path.expanduser('~/.vibe/logs/session/unified/*/meta.json'))):
     m = json.load(open(d))
-    if (m.get('environment') or {}).get('working_directory') == repo:
+    cwd = (m.get('environment') or {}).get('working_directory') or ''
+    if cwd == repo or cwd.startswith(repo + '/'):   # ce projet uniquement
         print(m.get('session_id'))
 ")
 for id in $IDS; do /tmp/ecriture-main/target/debug/session-export --export "$id" --branch; done   # sans --push
@@ -68,7 +72,7 @@ python3 .agents/skills/archive-vibe-sessions/rebase_vibe_sessions.py
 
 # 4) vérifications : ordre chrono, pas de code projet, 0 secret
 LAST=$(git for-each-ref --format='%(refname:short)' refs/heads/vibe/ | sort | tail -1)
-git log --format='%h %ad %s' --date=iso "$LAST"          # 9 sessions, dates croissantes
+git log --format='%h %ad %s' --date=iso "$LAST"          # N sessions, dates croissantes
 for b in $(git for-each-ref --format='%(refname)' refs/heads/vibe/); do
   git ls-tree -r --name-only "$b" | grep -v '^sessions/'  # rien
   git ls-tree -r --name-only "$b" | grep -q "sessions/${b#refs/heads/vibe/session-}/" || echo "MANQUE $b"
@@ -84,6 +88,28 @@ git push --force-with-lease origin 'refs/heads/vibe/*'
 - `rebase_vibe_sessions.py` — rebase chronologique (chaîne ordonnée par
   `start_time`, dates = timestamp de session) + masquage des secrets dans tous
   les blobs ; mode `--scan` pour vérifier qu'il ne reste aucun secret.
+- `.vibe/hooks.toml` + `.vibe/hooks/archive_vibe_sessions.sh` +
+  `.vibe/hooks/archive_vibe_sessions_context.py` — hooks **projet** (actifs
+  dès que le clone est trusté) : `session_start` injecte l'obligation de
+  suivre ce skill dans le contexte du modèle ; `session_end` lance
+  l'export filtré + rebase + scrub + push, détaché via `setsid`.
+
+## Répliquer sur un autre ordinateur (via ce dépôt git)
+
+La méthode voyage avec le dépôt :
+
+```bash
+git clone <url-du-dépôt> && cd ecriture-rs
+git checkout export-inkml     # branche portant le skill et les hooks projet
+# trust le dossier une fois : vibe --trust (ou /trusted-folders dans Vibe)
+git fetch origin '+refs/heads/vibe/*:refs/heads/vibe/*'   # arbre vibe/ des autres machines
+```
+
+Dès lors, toute session ouverte dans ce clone : le hook `session_start`
+injecte l'obligation de suivre ce skill, et le hook `session_end` exporte
+les sessions locales **de ce clone** (filtre cwd), les fusionne au rebase
+chronologique avec celles de l'autre machine (via `origin/vibe/*`), masque
+les secrets et push `--force-with-lease origin 'refs/heads/vibe/*'`.
 
 ## Pièges connus
 

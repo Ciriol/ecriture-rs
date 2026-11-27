@@ -1,0 +1,25 @@
+# Hooks projet ecriture-rs : toute session dans ce dépôt suit la méthode
+# d'archivage des sessions Vibe (skill .agents/skills/archive-vibe-sessions).
+# Ce fichier voyage avec le dépôt : sur toute machine qui clone ce dépôt et
+# trust le dossier, ces hooks s'activent automatiquement.
+
+# 1) Au démarrage de toute session : injecte dans le contexte du modèle
+#    l'obligation de charger et suivre le skill archive-vibe-sessions.
+[[hooks]]
+name = "archive-vibe-sessions-context"
+type = "session_start"
+command = "python3 \"$(git rev-parse --show-toplevel)/.vibe/hooks/archive_vibe_sessions_context.py\""
+timeout = 15.0
+description = "Rend obligatoire le skill archive-vibe-sessions (archivage des sessions Vibe en branches vibe/session-*)"
+
+# 2) À la fermeture de toute session : exporte les sessions en rapport avec ce
+#    projet en branches vibe/session-*, rebase chronologique par start_time,
+#    secrets masqués, puis push --force-with-lease. Détaché (setsid) pour
+#    survivre à la fermeture de Vibe (les hooks session_end sont arrêtés 2 s
+#    après /exit).
+[[hooks]]
+name = "archive-vibe-sessions"
+type = "session_end"
+command = "setsid sh \"$(git rev-parse --show-toplevel)/.vibe/hooks/archive_vibe_sessions.sh\" >/tmp/vibe-archive-session.log 2>&1 &"
+timeout = 30.0
+description = "Archive les sessions Vibe du projet en branches vibe/session-* (rebase chrono, secrets masqués) et push --force-with-lease"

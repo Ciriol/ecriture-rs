@@ -180,6 +180,26 @@ Combiner les deux : lancer l'app avec `--record-input`, injecter un scénario
 avec `uinput-pilot`, puis rejouer le JSONL — le bug est figé et rejouable à
 l'identique (couvert par les tests `record_puis_replay_*`).
 
+## Archiver les sessions Vibe (branche `vibe/`, sans code)
+
+`src/bin/session-export.rs` exporte les sessions journalisées localement
+(`~/.vibe/logs/session/unified/<id>/`) dans une branche par session sous le
+namespace `vibe/` — **aucun fichier du projet n'y est poussé** (vérifié) :
+
+```bash
+cargo run --bin session-export -- --list                          # sessions trouvées
+cargo run --bin session-export -- --export last --branch --push   # branche vibe/session-<date>-<slug>
+cargo run --bin session-export -- --export all --branch           # toutes les sessions
+cargo run --bin session-export -- --export <id> --no-raw          # RESUME.md seul, sans journal brut
+```
+
+Chaque branche `vibe/session-<slug>` contient `sessions/<slug>/{RESUME.md
+(généré : messages, commandes, outils, records --record-input copiés),
+journal.jsonl, meta.json}` + l'index global `sessions/{README.md,index.json}`.
+Pousser tout l'arbre : `git push origin 'refs/heads/vibe/*'`. Le worktree
+courant n'est jamais modifié (plumbing git : `hash-object`/`update-index`/
+`commit-tree` sur index temporaire).
+
 ## Roadmap
 
 - **Modèle de trajectoires (online)** : `ink::strokes_to_features` produit déjà les features `[1, T, 8]` (x, y, dx, dy, dt, pression, cos/sin) ; `Recognizer::recognize_strokes` existe (fallback image CRNN pour l'instant). **Export InkML fait** (bouton *Exporter InkML* → `exports/ink-<date>.inkml`, channels X/Y/T/P + vérité terrain) pour constituer sa propre base de tracés online (compléter par IAM-OnDB / IRONOFF / MathWriting-InkML). Reste à brancher un LRU/petit transformer exporté en ONNX (`[1, T, F]`), inféré en pur Rust via **rten** (ou candle), avec état récurrent entre les appels. Le CRNN image reste la baseline mesurable (latence + CER).

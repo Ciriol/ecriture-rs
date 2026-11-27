@@ -980,6 +980,9 @@ struct Config {
     nbest: usize,
     /// Poids du lexique dans le rescoring (0 = désactivé).
     lm_weight: f64,
+    /// Poids du LM de caractères en shallow fusion pendant le beam CTC
+    /// (0 = désactivé). Le LM est construit depuis le lexique actif.
+    char_lm_weight: f64,
     /// Enregistre tous les événements d'input (frames egui + tablette evdev)
     /// dans un fichier JSONL, rejouable avec --replay-input.
     record_input: Option<String>,
@@ -1031,6 +1034,7 @@ impl Default for Config {
             beam: 16,
             nbest: 8,
             lm_weight: 2.0,
+            char_lm_weight: 0.4,
             record_input: None,
             replay_input: None,
             digits: DigitsMode::Auto,
@@ -1300,7 +1304,10 @@ fn usage_exit() -> ! {
     eprintln!(
         "usage: ecriture-rs [--pth FICHIER] [--repo owner/name] [--input-h N] [--input-w N]\n\
          \x20         [--norm 01|neg1] [--tablet-device /dev/input/eventN]\n\
-         \x20         [--lexicon PATH|none] [--beam N] [--nbest N] [--lm-weight F]\n\
+         \x20         [--lexicon PATH|none] [--beam N] [--nbest N] [--lm-weight F] [--char-lm-weight F]\n\
+         --char-lm-weight F : poids du LM de caractères (uni/bigrammes, construit depuis\n\
+         \x20         le lexique) en shallow fusion PENDANT le beam CTC, inspiré de\n\
+         \x20         githubharald/CTCDecoder ; 0 = désactivé (défaut 0.4).\n\
          \x20         [--digits auto|off|PATH] [--digits-threshold F]\n\
          \x20         [--record-input events.jsonl] [--replay-input events.jsonl]\n\
          --digits auto|off|PATH : classifieur de chiffres isolés (LR softmax MNIST,\n\
@@ -1318,7 +1325,7 @@ fn usage_exit() -> ! {
          \x20         incomplet -> warning + crashs ; env ECRITURE_RENDERER=glow).\n\
          défauts: --repo Sachin-0001/crnn-iam-handwriting (téléchargé via Hugging Face),\n\
          \x20         --input-h depuis config.json, --norm neg1, --lexicon embarqué (français),\n\
-         \x20         --beam 16, --nbest 8, --lm-weight 2.0,\n\
+         \x20         --beam 16, --nbest 8, --lm-weight 2.0, --char-lm-weight 0.4,\n\
          \x20         tablette: auto-détection (ou ECRITURE_TABLET_DEVICE)\n\
          \n\
          --pth FICHIER : checkpoint local, format détecté depuis les fichiers à côté :\n\
@@ -1402,6 +1409,12 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Config {
                     .and_then(|v| v.parse().ok())
                     .unwrap_or_else(|| usage_exit())
             }
+            "--char-lm-weight" => {
+                cfg.char_lm_weight = args
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| usage_exit())
+            }
             "--record-input" => {
                 cfg.record_input = Some(args.next().unwrap_or_else(|| usage_exit()))
             }
@@ -1478,7 +1491,7 @@ fn main() -> eframe::Result<()> {
         None => "désactivé".to_string(),
     };
     eprintln!(
-        "config: repo={} pth={:?} input_h={:?} input_w={:?} norm={:?} tablet_device={:?} beam={} nbest={} lm_weight={} lexique={} digits={:?} digits_threshold={}",
+        "config: repo={} pth={:?} input_h={:?} input_w={:?} norm={:?} tablet_device={:?} beam={} nbest={} lm_weight={} char_lm_weight={} lexique={} digits={:?} digits_threshold={}",
         cfg.repo,
         cfg.pth,
         cfg.input_h,
@@ -1488,6 +1501,7 @@ fn main() -> eframe::Result<()> {
         cfg.beam,
         cfg.nbest,
         cfg.lm_weight,
+        cfg.char_lm_weight,
         lex_info,
         cfg.digits,
         cfg.digits_threshold,
@@ -1497,6 +1511,8 @@ fn main() -> eframe::Result<()> {
         nbest: cfg.nbest,
         lm_weight: cfg.lm_weight,
         lexicon,
+        char_lm_weight: cfg.char_lm_weight,
+        char_lm: None, // construit depuis le lexique au chargement du modèle
     };
 
     // Source du modèle (priorité : --pth > --weights-url > --weights-dir >
@@ -1583,6 +1599,16 @@ mod tests {
         );
         assert!((cfg.digits_threshold - 0.5).abs() < 1e-6);
         assert_eq!(cfg.digits, DigitsMode::Auto);
+    }
+
+    #[test]
+    fn parse_args_char_lm_weight() {
+        let cfg = parse_args_from([].into_iter());
+        assert!((cfg.char_lm_weight - 0.4).abs() < 1e-9);
+        let cfg = parse_args_from(["--char-lm-weight".into(), "0".into()].into_iter());
+        assert_eq!(cfg.char_lm_weight, 0.0);
+        let cfg = parse_args_from(["--char-lm-weight".into(), "1.5".into()].into_iter());
+        assert!((cfg.char_lm_weight - 1.5).abs() < 1e-9);
     }
 
     #[test]

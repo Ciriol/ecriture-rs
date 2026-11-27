@@ -3,6 +3,7 @@
 //! associés. Le binaire `ecriture-rs` (src/main.rs) et les outils
 //! (src/bin/*.rs) s'appuient sur cette lib.
 
+pub mod charlm;
 pub mod digits;
 pub mod doctr;
 pub mod ink;

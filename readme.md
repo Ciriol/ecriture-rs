@@ -26,8 +26,10 @@ rendu en image grayscale avec marges + lissage (src/ink.rs)
 CRNN CNN-BiLSTM-CTC en candle, poids chargés depuis un .pth (src/model.rs, pthrs)
         │
         ▼
-beam search CTC N-best (src/recognizer.rs) + rescoring par lexique de langue
-(src/lexicon.rs, lexique français ~49k mots embarqué dans assets/) → texte affiché
+beam search CTC N-best en log-space (src/recognizer.rs) avec shallow fusion d'un
+LM de caractères uni/bigrammes pendant le beam (src/charlm.rs, construit depuis
+le lexique — inspiré de githubharald/CTCDecoder) + rescoring des N-best par
+lexique de langue (src/lexicon.rs, ~49k mots embarqués dans assets/) → texte affiché
 ```
 
 Le classifieur de chiffres isolés est une régression logistique multinomiale
@@ -80,6 +82,7 @@ Priorité de résolution : `--pth` > `--weights-url` > `--weights-dir` > auto-lo
 | `--beam N` | `16` | largeur du beam search CTC (`1` = décodage glouton) |
 | `--nbest N` | `8` | nombre d'hypothèses N-best rescorées par le lexique |
 | `--lm-weight F` | `2.0` | poids du lexique : `score = logp_ctc/len + F × couverture_lexicale` (`0` = désactivé) |
+| `--char-lm-weight F` | `0.4` | poids du LM de caractères (unigrammes+bigrammes, construit depuis le lexique actif) en **shallow fusion pendant le beam CTC** — inspiré de [githubharald/CTCDecoder](https://github.com/githubharald/CTCDecoder) (`beam_search` + `LanguageModel`) : chaque extension de préfixe ajoute `F × ln P(c \| dernier char)`, score LM normalisé par la longueur en fin de beam. `0` = désactivé ; sans lexique (`--lexicon none`) pas de LM char |
 | `--digits auto\|off\|PATH` | `auto` | classifieur de chiffres isolés (LR softmax MNIST) : `auto` = poids embarqués `assets/digits-lr.f32`, `off` = désactivé (que le CRNN), `PATH` = poids custom (.f32 brut 31400 o ou .json `{"w":[[…784…]x10],"b":[…10…]}`, repli sur l'embarqué si illisible) |
 | `--digits-threshold F` | `0.85` | confiance softmax minimale pour qu'un glyphe isolé soit reconnu comme chiffre 0-9 par le LR ; sinon repli sur le CRNN |
 
@@ -124,6 +127,8 @@ ecriture-rs/
 │   │                   ou .f32/.json custom), rendu strokes 28x28, heuristique glyphe isolé,
 │   │                   lecteur IDX MNIST + entraînement SGD (entraînement hors-ligne)
 │   ├── ink.rs          Point/Stroke, resample, lissage, rendu image grayscale avec marges, export InkML
+│   ├── charlm.rs       LM de caractères (uni/bigrammes, backoff, pondération Zipf depuis le
+│   │                   lexique) pour la shallow fusion dans le beam CTC (style CTCDecoder)
 │   ├── lexicon.rs      lexique de langue + couverture lexicale d'une hypothèse
 │   ├── tablet.rs       lecture evdev du stylet (thread + channel + réveil egui)
 │   ├── model.rs        CRNN "Sachin" candle-nn, chargement .pth (pthrs), téléchargement HF
@@ -173,6 +178,11 @@ lexique** (`--lm-weight`, lexique français embarqué par défaut). Benchmarks r
   test complet, entraînement `train-digits-lr`) — test unitaire
   `classifieur_embarque_reconnait_les_echantillons_mnist` ; le routage
   glyphe-isolé→LR vs mot→CRNN est couvert par `hybride_glyphe_isole_*`.
+- Beam CTC log-space + LM de caractères : parité avec l'ancien beam sans LM
+  (`ctc_beam_decode_meme_regles_que_greedy`, `ctc_beam_prefere_...`), stabilité
+  `logaddexp`, shallow fusion LM qui fait gagner le bigram vu
+  (`beam_lm_char_fait_pencher_vers_le_bigram_vu`), LM embarqué FR cohérent
+  (`lm_embarque_francais_est_coherent` : P(e|l) > P(z|l), P(u|q) > P(a|q)).
 
 ## Tester l'input (record/replay + pilote uinput)
 
@@ -250,6 +260,14 @@ courant n'est jamais modifié (plumbing git : `hash-object`/`update-index`/
   : régression logistique (softmax) sur MNIST 28x28, 10 classes. Ici réimplémenté
   en pur Rust embarqué (entraînement `src/bin/train-digits-lr.rs` sur les fichiers
   IDX MNIST du dépôt upstream, inférence = matmul 784x10 + softmax, aucun moteur ML).
+- Le **LM de caractères en shallow fusion pendant le beam CTC** (`src/charlm.rs`
+  + `ctc_beam_decode_nbest_lm` dans `src/recognizer.rs`, beam réécrit en
+  log-space) reprend l'algorithme de
+  [githubharald/CTCDecoder](https://github.com/githubharald/CTCDecoder)
+  (`beam_search` + `apply_lm` + `BeamList.normalize`), réimplémenté en pur Rust :
+  le dépôt upstream est en Python, incompatible avec la cible 100 % Rust du
+  projet. Son `lexicon_search`/BK-tree est déjà couvert côté Rust par le
+  beam N-best + rescoring par lexique de mots.
 
 ## Licence
 

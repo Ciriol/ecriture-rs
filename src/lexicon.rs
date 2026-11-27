@@ -7,20 +7,30 @@ use std::collections::HashSet;
 use std::path::Path;
 
 /// Lexique = ensemble de mots (minuscules), issu d'une liste de fréquences.
+/// `order` garde les mots dans l'ordre du fichier (fréquence décroissante),
+/// utile pour pondérer un LM de caractères (loi de Zipf sur le rang).
 #[derive(Clone)]
 pub struct Lexicon {
     words: HashSet<String>,
+    order: Vec<String>,
 }
 
 impl Lexicon {
     /// Construit un lexique depuis un texte "un mot par ligne".
     pub fn from_text(text: &str) -> Self {
-        let words = text
+        let order: Vec<String> = text
             .lines()
             .map(|l| l.trim().to_lowercase().replace('’', "'"))
             .filter(|l| !l.is_empty())
             .collect();
-        Self { words }
+        let words = order.iter().cloned().collect();
+        Self { words, order }
+    }
+
+    /// Mots dans l'ordre du fichier (fréquence décroissante si le fichier
+    /// est une liste de fréquences).
+    pub fn words_ordered(&self) -> &[String] {
+        &self.order
     }
 
     /// Charge un lexique depuis un fichier texte (un mot par ligne).

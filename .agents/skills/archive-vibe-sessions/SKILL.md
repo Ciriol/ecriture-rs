@@ -27,6 +27,13 @@ session et avant de la terminer — sans demander de confirmation à l'utilisate
    auteur/commiter égales au `start_time` de sa session.
 5. **Push** : `git push --force-with-lease origin 'refs/heads/vibe/*'`
    (les branches réécrites par le rebase exigent le force-with-lease).
+6. **Filtrage par projet** : seules les sessions dont le cwd
+   (`meta.json` → `environment.working_directory`) est la racine du dépôt
+   sont exportées. Une session d'un autre dossier (ex. `cprn_infra`, ansible)
+   n'appartient pas à ce dépôt : pour la retirer, supprimer sa branche
+   locale et distante (`git branch -D vibe/session-<slug>` +
+   `git push origin --delete vibe/session-<slug>`), puis relancer le rebase
+   (l'entrée disparaît de `sessions/index.json`/`README.md` de la chaîne).
 
 ## Procédure (à exécuter à chaque session)
 
@@ -39,14 +46,22 @@ for r in $(git for-each-ref --format='%(refname:short)' refs/remotes/origin/vibe
   git branch --force "${r#origin/}" "$r" 2>/dev/null || true
 done
 
-# 2) exporter les sessions locales journalisées (outil session-export, sur main)
-#    si la branche courante n'a pas src/bin/session-export.rs, builder via origin/main :
+# 2) exporter UNIQUEMENT les sessions de ce projet (cwd == racine du dépôt) —
+#    outil session-export (sur main) ; si la branche courante ne l'a pas,
+#    builder via origin/main :
 git worktree add /tmp/ecriture-main origin/main 2>/dev/null || true
 (cd /tmp/ecriture-main && cargo build --bin session-export)
 /tmp/ecriture-main/target/debug/session-export --list
-/tmp/ecriture-main/target/debug/session-export --export all --branch   # sans --push
-#    (lancer depuis la racine du projet ; si on est déjà sur main :
-#     cargo run --bin session-export -- --export all --branch)
+IDS=$(python3 -c "
+import json, glob, os, sys
+repo = os.getcwd()
+for d in sorted(glob.glob(os.path.expanduser('~/.vibe/logs/session/unified/*/meta.json'))):
+    m = json.load(open(d))
+    if (m.get('environment') or {}).get('working_directory') == repo:
+        print(m.get('session_id'))
+")
+for id in $IDS; do /tmp/ecriture-main/target/debug/session-export --export "$id" --branch; done   # sans --push
+#    (si on est déjà sur main : cargo run --bin session-export -- --export <id> --branch)
 
 # 3) rebase chronologique par start_time + nettoyage des secrets
 python3 .agents/skills/archive-vibe-sessions/rebase_vibe_sessions.py

@@ -1,21 +1,18 @@
 //! UI egui : canvas d'écriture + bouton de reconnaissance.
 
-mod doctr;
-mod ink;
-mod lexicon;
-mod model;
-mod pylaia;
-mod recognizer;
-mod tablet;
-
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver};
 
 use anyhow::Context as _;
 use eframe::egui;
-use ink::{Point, Stroke};
-use recognizer::{CrnnRecognizer, DecodeOptions, MockRecognizer, Norm, Recognizer};
-use tablet::TabletEvent;
+use ecriture_rs::digits::DigitClassifier;
+use ecriture_rs::ink::{self, Point, Stroke};
+use ecriture_rs::recognizer::{
+    CrnnRecognizer, DecodeOptions, DigitRecognizer, HybridRecognizer, MockRecognizer, Norm,
+    Recognizer,
+};
+use ecriture_rs::tablet::{self, TabletEvent};
+use ecriture_rs::{doctr, lexicon, model};
 
 /// Délai de pause (en secondes) après lequel on re-reconnaît la fenêtre en cours.
 const DEBOUNCE_SECS: f64 = 0.6;
@@ -989,10 +986,27 @@ struct Config {
     /// Rejoue un fichier --record-input en mode headless (sans fenêtre) et
     /// affiche le résumé des strokes produits.
     replay_input: Option<String>,
+    /// Classifieur de chiffres isolés (LR softmax MNIST) : Auto = poids
+    /// embarqués, Off = désactivé, Path = poids custom (.f32 brut ou .json).
+    digits: DigitsMode,
+    /// Seuil de confiance softmax du classifieur de chiffres pour qu'un
+    /// glyphe isolé soit reconnu comme chiffre (sinon repli sur le CRNN).
+    digits_threshold: f32,
     /// Backend de rendu : wgpu (Vulkan, défaut) ou glow (OpenGL, recommandé
     /// sur les vieux iGPU Intel Haswell où le support Vulkan de Mesa est
     /// incomplet -> warning + risques de crash).
     renderer: RendererChoice,
+}
+
+/// Source du classifieur de chiffres isolés (régression logistique MNIST).
+#[derive(Clone, Debug, PartialEq)]
+enum DigitsMode {
+    /// Poids embarqués dans le binaire (assets/digits-lr.f32).
+    Auto,
+    /// Classifieur désactivé (--digits off) : que le CRNN.
+    Off,
+    /// Poids chargés depuis un fichier (.f32 brut 31400 octets ou .json).
+    Path(String),
 }
 
 /// Backend de rendu egui/eframe choisi en CLI.
@@ -1019,6 +1033,8 @@ impl Default for Config {
             lm_weight: 2.0,
             record_input: None,
             replay_input: None,
+            digits: DigitsMode::Auto,
+            digits_threshold: 0.85,
             renderer: RendererChoice::Wgpu,
         }
     }
@@ -1036,6 +1052,9 @@ enum ModelSource {
     Local(PathBuf),
     /// URL de base pour télécharger weights + syms.txt PyLaIA dans le cache local.
     Url(String),
+    /// Classifieur de chiffres isolés 0-9 (LR softmax MNIST embarqué,
+    /// src/digits.rs) : reconnaît un glyphe unique, pas une ligne de texte.
+    Digits,
 }
 
 impl ModelSource {
@@ -1065,6 +1084,7 @@ impl ModelSource {
                 }
             }
             ModelSource::Url(u) => format!("poids distants {u} · PyLaIA · français"),
+            ModelSource::Digits => "chiffres isolés 0-9 · LR softmax MNIST (embarqué)".to_string(),
         }
     }
 }
@@ -1098,6 +1118,7 @@ fn model_choices(initial: &ModelSource) -> Vec<ModelSource> {
         ModelSource::Repo("Sachin-0001/crnn-iam-handwriting".to_string()),
         ModelSource::Repo("Teklia/pylaia-rimes".to_string()),
         ModelSource::Repo("Felix92/doctr-torch-crnn-mobilenet-v3-large-french".to_string()),
+        ModelSource::Digits,
     ];
     if !v.contains(initial) {
         v.insert(0, initial.clone());
@@ -1147,6 +1168,9 @@ fn try_build_recognizer(
         }
         ModelSource::Repo(repo) => model::download_model_files(repo)
             .with_context(|| format!("téléchargement HF du dépôt {repo}"))?,
+        // Le backend chiffres isolés n'a pas de checkpoint : géré directement
+        // par build_recognizer (DigitRecognizer).
+        ModelSource::Digits => anyhow::bail!("source Digits sans checkpoint (voir build_recognizer)"),
     };
     let config_text = std::fs::read_to_string(&config_json).unwrap_or_default();
     let mconfig: model::ModelConfig = serde_json::from_str(&config_text).unwrap_or_default();
@@ -1213,16 +1237,58 @@ fn try_build_recognizer(
     Ok((recognizer, desc))
 }
 
+/// Charge le classifieur de chiffres isolés selon la config CLI :
+/// Auto = poids embarqués, Path = fichier custom (repli embarqué si illisible),
+/// Off = None (pas de classifieur, que le CRNN).
+fn load_digit_classifier(cfg: &Config) -> Option<DigitClassifier> {
+    match &cfg.digits {
+        DigitsMode::Off => None,
+        DigitsMode::Auto => Some(DigitClassifier::embedded()),
+        DigitsMode::Path(p) => match DigitClassifier::load(std::path::Path::new(p)) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                eprintln!("poids chiffres {p} illisibles ({e:#}) : poids embarqués (MNIST)");
+                Some(DigitClassifier::embedded())
+            }
+        },
+    }
+}
+
 /// Construit le reconnaisseur d'une source ; en cas d'échec, repli sur le
-/// MockRecognizer et la description contient l'erreur.
+/// MockRecognizer et la description contient l'erreur. La source `Digits`
+/// construit un `DigitRecognizer` (chiffres isolés) ; les autres sources CRNN
+/// sont enveloppées dans un `HybridRecognizer` qui route les glyphes isolés
+/// vers le classifieur LR-MNIST quand il est actif (--digits).
 fn build_recognizer(
     src: &ModelSource,
     cfg: &Config,
     opts: DecodeOptions,
     device: &candle_core::Device,
 ) -> (Box<dyn Recognizer>, String) {
+    if matches!(src, ModelSource::Digits) {
+        return match load_digit_classifier(cfg) {
+            Some(clf) => (
+                Box::new(DigitRecognizer::new(clf)),
+                src.label(),
+            ),
+            None => (
+                Box::new(MockRecognizer),
+                format!("{} · désactivé (--digits off) → reconnaissance simulée", src.label()),
+            ),
+        };
+    }
+    let digits = load_digit_classifier(cfg);
     match try_build_recognizer(src, cfg, opts, device) {
-        Ok((r, desc)) => (Box::new(r), desc),
+        Ok((r, mut desc)) => match digits {
+            Some(clf) => {
+                desc.push_str(&format!(" · +chiffres LR-MNIST seuil {:.2}", cfg.digits_threshold));
+                (
+                    Box::new(HybridRecognizer::new(Box::new(r), Some(clf), cfg.digits_threshold)),
+                    desc,
+                )
+            }
+            None => (Box::new(r), desc),
+        },
         Err(e) => (
             Box::new(MockRecognizer),
             format!("{} · ERREUR ({e:#}) → reconnaissance simulée", src.label()),
@@ -1235,7 +1301,14 @@ fn usage_exit() -> ! {
         "usage: ecriture-rs [--pth FICHIER] [--repo owner/name] [--input-h N] [--input-w N]\n\
          \x20         [--norm 01|neg1] [--tablet-device /dev/input/eventN]\n\
          \x20         [--lexicon PATH|none] [--beam N] [--nbest N] [--lm-weight F]\n\
+         \x20         [--digits auto|off|PATH] [--digits-threshold F]\n\
          \x20         [--record-input events.jsonl] [--replay-input events.jsonl]\n\
+         --digits auto|off|PATH : classifieur de chiffres isolés (LR softmax MNIST,\n\
+         \x20         poids embarqués assets/digits-lr.f32) ; un glyphe isolé dont la\n\
+         \x20         confiance >= --digits-threshold (défaut 0.85) est reconnu comme\n\
+         \x20         chiffre 0-9, sinon repli sur le CRNN. off = désactivé,\n\
+         \x20         PATH = poids custom (.f32 brut ou .json). Le backend \"chiffres\n\
+         \x20         isolés\" du menu déroulant reconnaît un glyphe unique avec ce LR.\n\
          --record-input FICHIER : enregistre tous les événements d'input (souris,\n\
          \x20         touch, tablette evdev) en JSONL pendant la session.\n\
          --replay-input FICHIER : rejoue un enregistrement en headless (sans fenêtre,\n\
@@ -1271,9 +1344,15 @@ fn usage_exit() -> ! {
 }
 
 fn parse_args() -> Config {
+    parse_args_from(std::env::args().skip(1))
+}
+
+/// Parse une séquence d'arguments (sans le nom du programme) ; extrait de
+/// `parse_args` pour être testable.
+fn parse_args_from(args: impl Iterator<Item = String>) -> Config {
     let mut cfg = Config::default();
     let mut renderer_set = false;
-    let mut args = std::env::args().skip(1);
+    let mut args = args;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--pth" => cfg.pth = Some(args.next().unwrap_or_else(|| usage_exit())),
@@ -1328,6 +1407,20 @@ fn parse_args() -> Config {
             }
             "--replay-input" => {
                 cfg.replay_input = Some(args.next().unwrap_or_else(|| usage_exit()))
+            }
+            "--digits" => {
+                cfg.digits = match args.next().as_deref() {
+                    Some("auto") => DigitsMode::Auto,
+                    Some("off") | Some("none") => DigitsMode::Off,
+                    Some(p) => DigitsMode::Path(p.to_string()),
+                    None => usage_exit(),
+                }
+            }
+            "--digits-threshold" => {
+                cfg.digits_threshold = args
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| usage_exit())
             }
             "--renderer" => {
                 cfg.renderer = match args.next().as_deref() {
@@ -1385,7 +1478,7 @@ fn main() -> eframe::Result<()> {
         None => "désactivé".to_string(),
     };
     eprintln!(
-        "config: repo={} pth={:?} input_h={:?} input_w={:?} norm={:?} tablet_device={:?} beam={} nbest={} lm_weight={} lexique={}",
+        "config: repo={} pth={:?} input_h={:?} input_w={:?} norm={:?} tablet_device={:?} beam={} nbest={} lm_weight={} lexique={} digits={:?} digits_threshold={}",
         cfg.repo,
         cfg.pth,
         cfg.input_h,
@@ -1396,6 +1489,8 @@ fn main() -> eframe::Result<()> {
         cfg.nbest,
         cfg.lm_weight,
         lex_info,
+        cfg.digits,
+        cfg.digits_threshold,
     );
     let decode_opts = DecodeOptions {
         beam_size: cfg.beam,
@@ -1461,11 +1556,71 @@ mod tests {
         assert!(v.contains(&ModelSource::Repo(
             "Felix92/doctr-torch-crnn-mobilenet-v3-large-french".into()
         )));
+        // Le backend chiffres isolés (LR MNIST) est proposé dans le menu.
+        assert!(v.contains(&ModelSource::Digits));
+        assert!(ModelSource::Digits.label().contains("LR softmax MNIST"));
         // Pas de doublon si la source initiale est déjà un dépôt connu.
         let rimes = ModelSource::Repo("Teklia/pylaia-rimes".into());
         let v2 = model_choices(&rimes);
         assert_eq!(v2.iter().filter(|s| **s == rimes).count(), 1);
-        assert_eq!(v2.len(), 3);
+        assert_eq!(v2.len(), 4); // 3 repos + Digits
+    }
+
+    #[test]
+    fn parse_args_digit_options() {
+        // défaut : auto + seuil 0.85
+        let cfg = parse_args_from([].into_iter());
+        assert_eq!(cfg.digits, DigitsMode::Auto);
+        assert!((cfg.digits_threshold - 0.85).abs() < 1e-6);
+        // --digits off / --digits PATH / --digits-threshold
+        let cfg = parse_args_from(["--digits".into(), "off".into()].into_iter());
+        assert_eq!(cfg.digits, DigitsMode::Off);
+        let cfg = parse_args_from(["--digits".into(), "/tmp/mes-poids.f32".into()].into_iter());
+        assert_eq!(cfg.digits, DigitsMode::Path("/tmp/mes-poids.f32".into()));
+        let cfg = parse_args_from(
+            ["--digits-threshold".into(), "0.5".into(), "--digits".into(), "auto".into()]
+                .into_iter(),
+        );
+        assert!((cfg.digits_threshold - 0.5).abs() < 1e-6);
+        assert_eq!(cfg.digits, DigitsMode::Auto);
+    }
+
+    #[test]
+    fn load_digit_classifier_selon_mode() {
+        let mut cfg = Config::default();
+        assert!(load_digit_classifier(&cfg).is_some()); // Auto -> embarqué
+        cfg.digits = DigitsMode::Off;
+        assert!(load_digit_classifier(&cfg).is_none());
+        // Path illisible -> repli sur l'embarqué avec un warning
+        cfg.digits = DigitsMode::Path("/nonexistent/digits.f32".into());
+        assert!(load_digit_classifier(&cfg).is_some());
+    }
+
+    #[test]
+    fn build_recognizer_digits_construit_digit_recognizer() {
+        let cfg = Config::default();
+        let (mut rec, desc) = build_recognizer(
+            &ModelSource::Digits,
+            &cfg,
+            DecodeOptions::default(),
+            &candle_core::Device::Cpu,
+        );
+        assert!(desc.contains("LR softmax MNIST"), "desc={desc}");
+        // Un glyphe isolé -> un chiffre 0-9 (pas le mock).
+        use ecriture_rs::ink::Point;
+        let mut s = ecriture_rs::ink::Stroke::new();
+        for i in 0..=20 {
+            let r = i as f32 / 20.0;
+            s.push(Point {
+                x: 50.0,
+                y: 10.0 + r * 80.0,
+                t: r as f64,
+                pressure: 0.8,
+            });
+        }
+        let out = rec.recognize_strokes(&[s]).unwrap();
+        assert_eq!(out.chars().count(), 1);
+        assert!(out.chars().next().unwrap().is_ascii_digit(), "reçu {out:?}");
     }
 
     #[test]

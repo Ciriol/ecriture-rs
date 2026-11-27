@@ -503,6 +503,116 @@ impl Recognizer for MockRecognizer {
     }
 }
 
+/// Reconnaissance d'un chiffre isolé (0-9) par le classifieur de régression
+/// logistique softmax entraîné sur MNIST (src/digits.rs, inspiré de
+/// sktan888/handwriting_recognition_logistic_regression). Backend autonome,
+/// sélectionnable dans le menu de l'UI : l'entrée est rendue (ou redimensionnée)
+/// en 28x28.
+pub struct DigitRecognizer {
+    clf: crate::digits::DigitClassifier,
+    /// Dernière image 28x28 envoyée au classifieur (debug UI).
+    last_input: Option<GrayImage>,
+}
+
+impl DigitRecognizer {
+    pub fn new(clf: crate::digits::DigitClassifier) -> Self {
+        Self {
+            clf,
+            last_input: None,
+        }
+    }
+
+    /// Classifieur embarqué (`assets/digits-lr.f32`).
+    pub fn embedded() -> Self {
+        Self::new(crate::digits::DigitClassifier::embedded())
+    }
+}
+
+impl Recognizer for DigitRecognizer {
+    fn recognize(&mut self, img: &GrayImage) -> Result<String> {
+        let small = image::imageops::resize(
+            img,
+            crate::digits::MNIST_SIZE,
+            crate::digits::MNIST_SIZE,
+            image::imageops::FilterType::Triangle,
+        );
+        self.last_input = Some(small.clone());
+        let (d, _proba, _all) = self.clf.predict(&small);
+        Ok(d.to_string())
+    }
+
+    fn recognize_strokes(&mut self, strokes: &[crate::ink::Stroke]) -> Result<String> {
+        let img = crate::digits::render_strokes_28(strokes);
+        self.last_input = Some(img.clone());
+        let (d, _proba, _all) = self.clf.predict(&img);
+        Ok(d.to_string())
+    }
+
+    fn last_input_image(&self) -> Option<&GrayImage> {
+        self.last_input.as_ref()
+    }
+}
+
+/// Reconnaissance hybride CRNN + classifieur de chiffres isolés : quand les
+/// strokes forment un seul glyphe compact (`digits::looks_like_single_glyph`),
+/// le LR-MNIST prédit un chiffre ; si sa confiance softmax >= `digit_threshold`,
+/// c'est le résultat, sinon on retombe sur le reconnaisseur interne (CRNN,
+/// lignes de texte). Améliore la détection des chiffres isolés (dates,
+/// montants, numéros) où le CRNN confond 1/l, 0/O, 5/S...
+pub struct HybridRecognizer {
+    inner: Box<dyn Recognizer>,
+    digits: Option<crate::digits::DigitClassifier>,
+    digit_threshold: f32,
+}
+
+impl HybridRecognizer {
+    pub fn new(
+        inner: Box<dyn Recognizer>,
+        digits: Option<crate::digits::DigitClassifier>,
+        digit_threshold: f32,
+    ) -> Self {
+        Self {
+            inner,
+            digits,
+            digit_threshold,
+        }
+    }
+
+    /// Le classifieur de chiffres est-il actif ?
+    pub fn digits_active(&self) -> bool {
+        self.digits.is_some()
+    }
+
+    pub fn digit_threshold(&self) -> f32 {
+        self.digit_threshold
+    }
+}
+
+impl Recognizer for HybridRecognizer {
+    fn recognize(&mut self, img: &GrayImage) -> Result<String> {
+        // Image fournie telle quelle (ligne de texte) : pas d'heuristique de
+        // glyphe possible -> le reconnaisseur interne.
+        self.inner.recognize(img)
+    }
+
+    fn recognize_strokes(&mut self, strokes: &[crate::ink::Stroke]) -> Result<String> {
+        if let Some(clf) = &self.digits {
+            if crate::digits::looks_like_single_glyph(strokes) {
+                let img = crate::digits::render_strokes_28(strokes);
+                let (digit, proba, _all) = clf.predict(&img);
+                if proba >= self.digit_threshold {
+                    return Ok(digit.to_string());
+                }
+            }
+        }
+        self.inner.recognize_strokes(strokes)
+    }
+
+    fn last_input_image(&self) -> Option<&GrayImage> {
+        self.inner.last_input_image()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -596,6 +706,79 @@ mod tests {
         assert_eq!(Norm::NegOneOne.apply(1.0), 1.0);
         assert_eq!(Norm::NegOneOne.apply(0.0), -1.0);
         assert_eq!(Norm::ZeroOne.apply(0.5), 0.5);
+    }
+
+    /// Stroke "1" : trait vertical isolé.
+    fn stroke_vertical() -> Vec<crate::ink::Stroke> {
+        use crate::ink::Point;
+        let mut s = crate::ink::Stroke::new();
+        for i in 0..=20 {
+            let r = i as f32 / 20.0;
+            s.push(Point {
+                x: 50.0 + r * 4.0,
+                y: 10.0 + r * 80.0,
+                t: r as f64,
+                pressure: 0.8,
+            });
+        }
+        vec![s]
+    }
+
+    /// Stroke "mot" : longue ligne horizontale (plusieurs glyphes).
+    fn stroke_mot() -> Vec<crate::ink::Stroke> {
+        use crate::ink::Point;
+        let mut s = crate::ink::Stroke::new();
+        for i in 0..=40 {
+            let r = i as f32 / 40.0;
+            s.push(Point {
+                x: 10.0 + r * 300.0,
+                y: 50.0 + (r * 8.0).sin() * 5.0,
+                t: r as f64,
+                pressure: 0.8,
+            });
+        }
+        vec![s]
+    }
+
+    #[test]
+    fn hybride_glyphe_isole_passe_par_le_lr_mot_par_le_crnn() {
+        // Seuil très bas : même avec des poids nuls (proba uniforme 0.1), le
+        // LR répond un chiffre pour un glyphe isolé.
+        let clf = crate::digits::DigitClassifier::embedded();
+        let mut rec = HybridRecognizer::new(Box::new(MockRecognizer), Some(clf), 0.05);
+        assert!(rec.digits_active());
+        let out = rec.recognize_strokes(&stroke_vertical()).unwrap();
+        assert_eq!(out.chars().count(), 1);
+        assert!(out.chars().next().unwrap().is_ascii_digit(), "attendu un chiffre, reçu {out:?}");
+        // Un "mot" (ligne longue) reste délégué au CRNN/mock.
+        assert_eq!(rec.recognize_strokes(&stroke_mot()).unwrap(), "[reconnaissance simulée]");
+    }
+
+    #[test]
+    fn hybride_sans_classifieur_delegue_toujours() {
+        let mut rec = HybridRecognizer::new(Box::new(MockRecognizer), None, 0.85);
+        assert!(!rec.digits_active());
+        assert_eq!(rec.recognize_strokes(&stroke_vertical()).unwrap(), "[reconnaissance simulée]");
+    }
+
+    #[test]
+    fn digit_recognizer_reconnait_echantillons_mnist() {
+        let mut rec = DigitRecognizer::embedded();
+        let samples = crate::digits::embedded_samples();
+        assert!(samples.len() >= 50);
+        let mut ok = 0;
+        for (label, px) in &samples {
+            let img = GrayImage::from_fn(crate::digits::MNIST_SIZE, crate::digits::MNIST_SIZE, |x, y| {
+                image::Luma([px[(y * crate::digits::MNIST_SIZE + x) as usize]])
+            });
+            if rec.recognize(&img).unwrap() == label.to_string() {
+                ok += 1;
+            }
+        }
+        let acc = ok as f32 / samples.len() as f32;
+        assert!(acc >= 0.80, "accuracy DigitRecognizer {acc} < 0.80");
+        // last_input_image exposé pour le debug
+        assert!(rec.last_input_image().is_some());
     }
 
     fn levenshtein(a: &[char], b: &[char]) -> usize {

@@ -13,6 +13,13 @@ Prise de notes avec **reconnaissance d'écriture manuscrite quasi temps réel, 1
 strokes (egui souris/touch  |  evdev pour le stylet /dev/input)
         │
         ▼
+fenêtre = un seul glyphe compact ? (digits::looks_like_single_glyph)
+        │oui
+        ▼
+LR softmax MNIST 28x28 (src/digits.rs, poids ~31 Ko embarqués
+assets/digits-lr.f32) → chiffre 0-9 si confiance >= --digits-threshold
+        │non (ou confiance insuffisante)
+        ▼
 rendu en image grayscale avec marges + lissage (src/ink.rs)
         │
         ▼
@@ -22,6 +29,16 @@ CRNN CNN-BiLSTM-CTC en candle, poids chargés depuis un .pth (src/model.rs, pthr
 beam search CTC N-best (src/recognizer.rs) + rescoring par lexique de langue
 (src/lexicon.rs, lexique français ~49k mots embarqué dans assets/) → texte affiché
 ```
+
+Le classifieur de chiffres isolés est une régression logistique multinomiale
+(softmax 784→10) entraînée sur MNIST, en pur Rust et embarquée — inspiré de
+[sktan888/handwriting_recognition_logistic_regression](https://github.com/sktan888/handwriting_recognition_logistic_regression)
+(voir *Crédits*). Il fiabilise la détection des chiffres isolés (dates,
+montants, numéros) que le CRNN peut confondre (1/l, 0/O, 5/S) : accuracy
+~92 % sur le test MNIST complet, ~95 % sur les 100 échantillons embarqués
+(`assets/mnist-samples.bin`, test unitaire). Réentraînement hors-ligne :
+`cargo run --release --bin train-digits-lr -- <dossier MNIST IDX>`. Le backend
+**chiffres isolés** du menu déroulant reconnaît un glyphe unique avec ce LR.
 
 - Reconnaissance **incrémentale** : 0,6 s après la fin d'un tracé, seuls les nouveaux strokes sont reconnus et ajoutés au texte.
 - **Stylet Linux** : lu directement via evdev (`src/tablet.rs`) quand winit ne remonte rien ; contact détecté par `BTN_TOUCH`/pression, coordonnées normalisées depuis les bornes du périphérique, pression `ABS_PRESSURE` conservée dans chaque point.
@@ -63,8 +80,10 @@ Priorité de résolution : `--pth` > `--weights-url` > `--weights-dir` > auto-lo
 | `--beam N` | `16` | largeur du beam search CTC (`1` = décodage glouton) |
 | `--nbest N` | `8` | nombre d'hypothèses N-best rescorées par le lexique |
 | `--lm-weight F` | `2.0` | poids du lexique : `score = logp_ctc/len + F × couverture_lexicale` (`0` = désactivé) |
+| `--digits auto\|off\|PATH` | `auto` | classifieur de chiffres isolés (LR softmax MNIST) : `auto` = poids embarqués `assets/digits-lr.f32`, `off` = désactivé (que le CRNN), `PATH` = poids custom (.f32 brut 31400 o ou .json `{"w":[[…784…]x10],"b":[…10…]}`, repli sur l'embarqué si illisible) |
+| `--digits-threshold F` | `0.85` | confiance softmax minimale pour qu'un glyphe isolé soit reconnu comme chiffre 0-9 par le LR ; sinon repli sur le CRNN |
 
-Dans l'UI : tracer dans la zone centrale, **Reconnaître** (tout relire), **Effacer**, **Exporter InkML** (sauve les tracés dans `exports/ink-<date>.inkml`, format W3C InkML : un `<trace>` par stroke, channels X/Y/T/P + `<annotation type="truth">` avec le label), case **debug** (événements d'entrée reçus). Le champ **vérité terrain** (au-dessus du texte reconnu) est pré-rempli avec le texte reconnu et reste éditable : corrigez-le avant d'exporter pour constituer une base de tracés online (entraînement d'un modèle de trajectoires). En haut à droite, le **menu déroulant indique le modèle actif** (source, backend, taille d'entrée) et permet d'en **changer à chaud** — le chargement (téléchargement HF + parsing du checkpoint) se fait en arrière-plan, l'UI affiche « chargement… » puis re-reconnaît le texte à l'écran avec le nouveau modèle. Choix proposés : `Sachin-0001/crnn-iam-handwriting` (IAM anglais), `Teklia/pylaia-rimes` (PyLaIA français), `Felix92/doctr-torch-crnn-mobilenet-v3-large-french` (doctR français), plus la source passée en CLI si c'est un modèle local. Le panneau du **texte reconnu en bas est redimensionnable** (tirer sa bordure haute, 120–500 px, 200 px par défaut) : texte finalisé en 28 pt, hypothèse de la fenêtre glissante en gris en dessous.
+Dans l'UI : tracer dans la zone centrale, **Reconnaître** (tout relire), **Effacer**, **Exporter InkML** (sauve les tracés dans `exports/ink-<date>.inkml`, format W3C InkML : un `<trace>` par stroke, channels X/Y/T/P + `<annotation type="truth">` avec le label), case **debug** (événements d'entrée reçus). Le champ **vérité terrain** (au-dessus du texte reconnu) est pré-rempli avec le texte reconnu et reste éditable : corrigez-le avant d'exporter pour constituer une base de tracés online (entraînement d'un modèle de trajectoires). En haut à droite, le **menu déroulant indique le modèle actif** (source, backend, taille d'entrée) et permet d'en **changer à chaud** — le chargement (téléchargement HF + parsing du checkpoint) se fait en arrière-plan, l'UI affiche « chargement… » puis re-reconnaît le texte à l'écran avec le nouveau modèle. Choix proposés : `Sachin-0001/crnn-iam-handwriting` (IAM anglais), `Teklia/pylaia-rimes` (PyLaIA français), `Felix92/doctr-torch-crnn-mobilenet-v3-large-french` (doctR français), **chiffres isolés 0-9 · LR softmax MNIST** (poids embarqués, reconnaît un glyphe unique), plus la source passée en CLI si c'est un modèle local. Hors menu, chaque modèle CRNN est automatiquement enveloppé dans un `HybridRecognizer` : un glyphe isolé dont la confiance LR >= `--digits-threshold` est reconnu comme chiffre, le reste part au CRNN. Le panneau du **texte reconnu en bas est redimensionnable** (tirer sa bordure haute, 120–500 px, 200 px par défaut) : texte finalisé en 28 pt, hypothèse de la fenêtre glissante en gris en dessous.
 
 Exemples avec un modèle local :
 
@@ -95,17 +114,28 @@ cargo run --release -- --pth ~/modeles/crnn/model.pth --input-h 32 --norm neg1 -
 ecriture-rs/
 ├── Cargo.toml
 ├── assets/
-│   └── lexique-fr.txt  lexique français embarqué (~49k mots, fréquences corpus)
+│   ├── lexique-fr.txt      lexique français embarqué (~49k mots, fréquences corpus)
+│   ├── digits-lr.f32       poids LR softmax MNIST embarqués (10x784 + 10 f32 LE, 31400 o)
+│   └── mnist-samples.bin   100 échantillons test MNIST embarqués (u32 count + label/784 px)
 ├── src/
+│   ├── lib.rs          lib ecriture_rs (modules partagés bin + outils)
 │   ├── main.rs         UI egui, capture souris/touch, debounce, options CLI
+│   ├── digits.rs       classifieur de chiffres isolés : LR softmax 784->10 (poids embarqués
+│   │                   ou .f32/.json custom), rendu strokes 28x28, heuristique glyphe isolé,
+│   │                   lecteur IDX MNIST + entraînement SGD (entraînement hors-ligne)
 │   ├── ink.rs          Point/Stroke, resample, lissage, rendu image grayscale avec marges, export InkML
 │   ├── lexicon.rs      lexique de langue + couverture lexicale d'une hypothèse
 │   ├── tablet.rs       lecture evdev du stylet (thread + channel + réveil egui)
 │   ├── model.rs        CRNN "Sachin" candle-nn, chargement .pth (pthrs), téléchargement HF
 │   ├── doctr.rs        CRNN doctR mobilenet_v3_large (pytorch_model.bin)
 │   ├── pylaia.rs       CRNN PyLaIA LaiaCRNN (weights.ckpt + syms.txt, ex. RIMES FR)
-│   └── recognizer.rs   trait Recognizer, 3 backends, beam CTC N-best + rescoring lexique
+│   ├── recognizer.rs   trait Recognizer, backends CRNN + DigitRecognizer + HybridRecognizer
+│   │                   (glyphe isolé -> LR chiffres si confiance >= seuil, sinon CRNN),
+│   │                   beam CTC N-best + rescoring lexique
 │   └── bin/
+│       ├── train-digits-lr.rs  entraîne le LR MNIST depuis un dossier IDX (60k images,
+│       │                       ~16 s en release, accuracy ~92 %) et écrit assets/digits-lr.f32
+│       │                       + assets/mnist-samples.bin
 │       └── uinput-pilot.rs  pilote de périphériques virtuels (souris/stylet) via /dev/uinput
 ├── tools/
 │   └── scenario-stylet-puis-souris.txt  scénario d'injection uinput-pilot (exemple)
@@ -138,6 +168,11 @@ lexique** (`--lm-weight`, lexique français embarqué par défaut). Benchmarks r
   lignes (le modèle annonce 4.5 % sur les 778 lignes du test)
 - Parité Rust vs PyTorch validée sur les 3 backends (logits max|diff| < 6e-5) :
   `cargo test --release -- --ignored parite`
+- Classifieur de chiffres isolés (LR softmax MNIST embarqué) : accuracy
+  **0.95** sur les 100 échantillons MNIST embarqués (0.9237 sur les 10 000 du
+  test complet, entraînement `train-digits-lr`) — test unitaire
+  `classifieur_embarque_reconnait_les_echantillons_mnist` ; le routage
+  glyphe-isolé→LR vs mot→CRNN est couvert par `hybride_glyphe_isole_*`.
 
 ## Tester l'input (record/replay + pilote uinput)
 
@@ -204,8 +239,17 @@ courant n'est jamais modifié (plumbing git : `hash-object`/`update-index`/
 
 - **Modèle de trajectoires (online)** : `ink::strokes_to_features` produit déjà les features `[1, T, 8]` (x, y, dx, dy, dt, pression, cos/sin) ; `Recognizer::recognize_strokes` existe (fallback image CRNN pour l'instant). **Export InkML fait** (bouton *Exporter InkML* → `exports/ink-<date>.inkml`, channels X/Y/T/P + vérité terrain) pour constituer sa propre base de tracés online (compléter par IAM-OnDB / IRONOFF / MathWriting-InkML). Reste à brancher un LRU/petit transformer exporté en ONNX (`[1, T, F]`), inféré en pur Rust via **rten** (ou candle), avec état récurrent entre les appels. Le CRNN image reste la baseline mesurable (latence + CER).
 - ~~**Fenêtre glissante** avec hypothèses révisables~~ fait : les strokes non finalisés sont re-reconnus au debounce (0,6 s) et remplacés (hypothèse en gris) ; figés après 2 s de pause ou au-delà de 12 strokes.
-- **Segmentation** en mots/gestes (double-tap = espace, geste = retour à la ligne) via un petit classifieur séparé.
+- **Segmentation** en mots/gestes (double-tap = espace, geste = retour à la ligne) via un petit classifieur séparé. Brique déjà en place : le classifieur de glyphe isolé (`src/digits.rs`, LR MNIST) + l'heuristique `looks_like_single_glyph` routent déjà les glyphes uniques vers un classifieur dédié dans `HybridRecognizer`.
 - Quantifier le modèle (int8) et viser < 50 ms par fenêtre ; valider le CER sur tes propres strokes.
+
+## Crédits
+
+- Le classifieur de chiffres isolés (`src/digits.rs`, poids `assets/digits-lr.f32`)
+  s'inspire de
+  [sktan888/handwriting_recognition_logistic_regression](https://github.com/sktan888/handwriting_recognition_logistic_regression)
+  : régression logistique (softmax) sur MNIST 28x28, 10 classes. Ici réimplémenté
+  en pur Rust embarqué (entraînement `src/bin/train-digits-lr.rs` sur les fichiers
+  IDX MNIST du dépôt upstream, inférence = matmul 784x10 + softmax, aucun moteur ML).
 
 ## Licence
 

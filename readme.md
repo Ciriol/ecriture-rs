@@ -171,6 +171,11 @@ Deux machines, deux rôles, sessions archivées ensemble dans l'arbre `vibe` :
   hors dépôt, masqué dans l'archive vibe) — voir `archive-vibe-sessions`.
 - Pour lancer une tâche lourde sur yogarch : `ssh ciriol@192.168.1.34 'cd
   ~/Projets/ecriture-rs && cargo test --release -- --ignored bench_iam'`.
+- Pilotage sans confirmation : wrappers `yog '<cmd>'` et `yog-scp <src> <dst>`
+  dans `~/.local/bin` (clé `id_perso_yogarch`, repli askpass), préfixes
+  auto-approuvés dans `~/.vibe/config.toml` `[tools.bash] allowlist`
+  (`yog`, `yog-scp`, `ssh yogarch`, `scp yogarch:`) — s'applique après
+  `/reload` ou à la prochaine session.
 
 ## Tests
 

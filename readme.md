@@ -164,9 +164,11 @@ Deux machines, deux rôles, sessions archivées ensemble dans l'arbre `vibe` :
   (mots-clés du titre) ; `git fetch origin` ramène les sessions de l'autre
   machine, le rebuild les fusionne par date dans `vibe` / `vibe-interface` /
   `vibe-reconnaissance`.
-- SSH vers yogarch sans mot de passe en clair dans l'historique : askpass
-  lisant `~/.vibe/archive-scrub-local.txt` (chmod 600, hors dépôt, masqué
-  dans l'archive vibe) — voir `archive-vibe-sessions`.
+- SSH vers yogarch : alias `yogarch` (`~/.ssh/config`) + clé
+  `~/.ssh/id_perso_yogarch` (ed25519, générée sur yogarch puis privée
+  rapatriée ici, 600 ; la privée a été supprimée de yogarch). Repli mot de
+  passe via askpass lisant `~/.vibe/archive-scrub-local.txt` (chmod 600,
+  hors dépôt, masqué dans l'archive vibe) — voir `archive-vibe-sessions`.
 - Pour lancer une tâche lourde sur yogarch : `ssh ciriol@192.168.1.34 'cd
   ~/Projets/ecriture-rs && cargo test --release -- --ignored bench_iam'`.
 

@@ -224,12 +224,15 @@ pub fn detect_in_image(img: &GrayImage, p: &SegParams) -> Vec<BBox> {
         .collect()
 }
 
-/// Recadre `b` dans `img` (bornes serrées) et renvoie le crop.
-fn crop(img: &GrayImage, b: BBox) -> GrayImage {
-    let x = b.x.min(img.width().saturating_sub(1));
-    let y = b.y.min(img.height().saturating_sub(1));
-    let w = b.w.clamp(1, img.width() - x);
-    let h = b.h.clamp(1, img.height() - y);
+/// Recadre `b` dans `img` avec une marge de `pad` px de chaque côté (bornes
+/// serrées sur l'image) : le CRNN-IAM attend des marges autour du texte
+/// (comme `render_to_image` qui met ~75 % de la hauteur + padding horizontal).
+fn crop_padded(img: &GrayImage, b: BBox, pad: u32) -> GrayImage {
+    let x = b.x.saturating_sub(pad);
+    let y = b.y.saturating_sub(pad);
+    let x2 = (b.x + b.w + pad).min(img.width());
+    let y2 = (b.y + b.h + pad).min(img.height());
+    let (w, h) = (x2.saturating_sub(x).max(1), y2.saturating_sub(y).max(1));
     imageops::crop_imm(img, x, y, w, h).to_image()
 }
 
@@ -272,8 +275,9 @@ impl WordSegRecognizer {
             return self.inner.recognize(img);
         }
         let mut words = Vec::new();
+        let pad = img.height() / 8;
         for b in boxes {
-            let c = crop(img, b);
+            let c = crop_padded(img, b, pad);
             let s = self.inner.recognize(&c)?;
             let s = s.trim();
             if !s.is_empty() {
@@ -297,8 +301,9 @@ impl Recognizer for WordSegRecognizer {
             return self.inner.recognize_strokes(strokes);
         }
         let mut words = Vec::new();
+        let pad = img.height() / 8;
         for b in boxes {
-            let c = crop(&img, b);
+            let c = crop_padded(&img, b, pad);
             let s = self.inner.recognize(&c)?;
             let s = s.trim();
             if !s.is_empty() {

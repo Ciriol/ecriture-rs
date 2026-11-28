@@ -189,6 +189,17 @@ cargo test -- --ignored --nocapture # test réel : télécharge le modèle HF et
 cargo test --release -- --ignored --nocapture bench_iam
 ```
 
+Benchmark sur un vrai jeu de lignes (InkML IAM, ou images + GT) avec comparaison
+ligne entière vs `--word-seg` (CER/WER, `src/bin/bench-iam.rs`, lecteur InkML
+`src/inkml.rs` inspiré de MartinThoma/hwrt, métriques `src/eval.rs`) :
+
+```bash
+# dossier de *.inkml IAM (annotation type="truth") :
+cargo run --release --bin bench-iam -- /chemin/vers/iam_inkml --limit 50
+# ou images + GT (json {"fichier.png": "vérité", ...} ou sidecar <image>.txt) :
+cargo run --release --bin bench-iam -- /chemin/vers/images --images --gt gt.json
+```
+
 Le prétraitement colle au handler officiel du modèle : rendu des strokes en image
 avec marges (la bounding box occupe 75 % de la hauteur, largeur min 2×hauteur),
 trait ~hauteur/10, lissage du bruit capteur, puis resize **bilinéaire** à

@@ -6,7 +6,9 @@
 pub mod charlm;
 pub mod digits;
 pub mod doctr;
+pub mod eval;
 pub mod ink;
+pub mod inkml;
 pub mod lexicon;
 pub mod model;
 pub mod pylaia;

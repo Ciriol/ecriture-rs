@@ -12,3 +12,4 @@ pub mod model;
 pub mod pylaia;
 pub mod recognizer;
 pub mod tablet;
+pub mod wordseg;

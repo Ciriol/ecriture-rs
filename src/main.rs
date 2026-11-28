@@ -12,6 +12,7 @@ use ecriture_rs::recognizer::{
     Recognizer,
 };
 use ecriture_rs::tablet::{self, TabletEvent};
+use ecriture_rs::wordseg::WordSegRecognizer;
 use ecriture_rs::{doctr, lexicon, model};
 
 /// Délai de pause (en secondes) après lequel on re-reconnaît la fenêtre en cours.
@@ -1010,6 +1011,9 @@ struct Config {
     /// sur les vieux iGPU Intel Haswell où le support Vulkan de Mesa est
     /// incomplet -> warning + risques de crash).
     renderer: RendererChoice,
+    /// Segmente la ligne en mots (scale-space, inspiré de
+    /// githubharald/WordDetector) et reconnaît chaque mot séparément.
+    word_seg: bool,
 }
 
 /// Source du classifieur de chiffres isolés (régression logistique MNIST).
@@ -1051,6 +1055,7 @@ impl Default for Config {
             digits: DigitsMode::Auto,
             digits_threshold: 0.85,
             renderer: RendererChoice::Wgpu,
+            word_seg: false,
         }
     }
 }
@@ -1294,16 +1299,29 @@ fn build_recognizer(
     }
     let digits = load_digit_classifier(cfg);
     match try_build_recognizer(src, cfg, opts, device) {
-        Ok((r, mut desc)) => match digits {
-            Some(clf) => {
-                desc.push_str(&format!(" · +chiffres LR-MNIST seuil {:.2}", cfg.digits_threshold));
-                (
-                    Box::new(HybridRecognizer::new(Box::new(r), Some(clf), cfg.digits_threshold)),
-                    desc,
-                )
+        Ok((r, mut desc)) => {
+            let inner: Box<dyn Recognizer> = match digits {
+                Some(clf) => {
+                    desc.push_str(&format!(
+                        " · +chiffres LR-MNIST seuil {:.2}",
+                        cfg.digits_threshold
+                    ));
+                    Box::new(HybridRecognizer::new(
+                        Box::new(r),
+                        Some(clf),
+                        cfg.digits_threshold,
+                    ))
+                }
+                None => Box::new(r),
+            };
+            if cfg.word_seg {
+                desc.push_str(" · mots: scale-space (inspiré de githubharald/WordDetector)");
+                let render_h = cfg.input_h.unwrap_or(32).max(32) * 2;
+                (Box::new(WordSegRecognizer::new(inner, render_h)), desc)
+            } else {
+                (inner, desc)
             }
-            None => (Box::new(r), desc),
-        },
+        }
         Err(e) => (
             Box::new(MockRecognizer),
             format!("{} · ERREUR ({e:#}) → reconnaissance simulée", src.label()),
@@ -1320,7 +1338,11 @@ fn usage_exit() -> ! {
          \x20         le lexique) en shallow fusion PENDANT le beam CTC, inspiré de\n\
          \x20         githubharald/CTCDecoder ; 0 = désactivé (défaut 0.4).\n\
          \x20         [--digits auto|off|PATH] [--digits-threshold F]\n\
+         \x20         [--word-seg]\n\
          \x20         [--record-input events.jsonl] [--replay-input events.jsonl]\n\
+         --word-seg : segmente la ligne en mots (scale-space, inspiré de\n\
+         \x20         githubharald/WordDetector) et reconnaît chaque mot séparément,\n\
+         \x20         joint par des espaces ; repli ligne entière si 1 seul mot.\n\
          --digits auto|off|PATH : classifieur de chiffres isolés (LR softmax MNIST,\n\
          \x20         poids embarqués assets/digits-lr.f32) ; un glyphe isolé dont la\n\
          \x20         confiance >= --digits-threshold (défaut 0.85) est reconnu comme\n\
@@ -1446,6 +1468,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Config {
                     .and_then(|v| v.parse().ok())
                     .unwrap_or_else(|| usage_exit())
             }
+            "--word-seg" => cfg.word_seg = true,
             "--renderer" => {
                 cfg.renderer = match args.next().as_deref() {
                     Some("glow") => RendererChoice::Glow,

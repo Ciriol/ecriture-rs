@@ -29,7 +29,8 @@ cargo run --bin session-export -- --list          # sessions Vibe journalisées 
 - `src/lib.rs` + modules — pipeline de reconnaissance :
   `ink.rs` (strokes → image), `model.rs` / `pylaia.rs` / `doctr.rs` (backends CRNN-CTC, poids `.pth` chargés via `pthrs`),
   `recognizer.rs` (beam search CTC N-best + rescoring), `charlm.rs` + `lexicon.rs` (LM de caractères + lexique FR embarqué),
-  `digits.rs` (classifieur de chiffres isolés, LR softmax MNIST embarquée), `tablet.rs` (stylet evdev).
+  `digits.rs` (classifieur de chiffres isolés, LR softmax MNIST embarquée), `tablet.rs` (stylet evdev),
+  `wordseg.rs` (segmentation de la ligne en mots, scale-space inspiré de githubharald/WordDetector, mode `--word-seg`).
 - `src/bin/` : `session-export` (export des sessions Vibe), `train-digits-lr` (réentraînement offline du LR MNIST), `uinput-pilot` (record/replay input).
 - `assets/` : poids et lexique embarqués (`digits-lr.f32`, `lexique-fr.txt`, `mnist-samples.bin`).
 - `tools/export-model/` : conversions de poids **hors ligne** (Python autorisé ici uniquement, jamais au runtime).

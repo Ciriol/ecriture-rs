@@ -12,9 +12,10 @@ use std::sync::mpsc::Sender;
 use std::thread;
 
 use evdev::{AbsoluteAxisCode, Device, EventType, KeyCode};
+use serde::{Deserialize, Serialize};
 
 /// Événement stylet, coordonnées normalisées 0..1 dans l'espace de l'écran.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub enum TabletEvent {
     Down { x: f32, y: f32, pressure: f32 },
     Move { x: f32, y: f32, pressure: f32 },
@@ -96,6 +97,18 @@ fn send_event(tx: &Sender<TabletEvent>, ctx: &egui::Context, ev: TabletEvent) {
     ctx.request_repaint();
 }
 
+/// Seuil de pression (0..1) à partir duquel un stylet est considéré en contact
+/// quand le driver n'émet pas BTN_TOUCH. En dessous, c'est de la proximité
+/// (hover) : un vrai Wacom envoie une pression > 0 en hover, il ne faut pas
+/// tracer dans ce cas.
+const PEN_PRESSURE_CONTACT: f32 = 0.5;
+
+/// Décision de contact à la fin d'un paquet SYN_REPORT : BTN_TOUCH enfoncé,
+/// ou (stylet uniquement) pression au-dessus du seuil de contact.
+fn is_contact(btn_touch: bool, is_pen: bool, pressure: f32) -> bool {
+    btn_touch || (is_pen && pressure >= PEN_PRESSURE_CONTACT)
+}
+
 fn read_loop(path: String, tx: Sender<TabletEvent>, ctx: egui::Context) {
     let mut dev = match Device::open(&path) {
         Ok(d) => d,
@@ -169,12 +182,13 @@ fn read_loop(path: String, tx: Sender<TabletEvent>, ctx: egui::Context) {
                     }
                 }
                 // Fin d'un paquet atomique : c'est ici qu'on décide du contact.
-                // Contact = BTN_TOUCH enfoncé, ou pression > 0 pour un stylet
-                // (certains drivers stylet n'émettent pas BTN_TOUCH). La fin du
-                // stroke = plus de contact, PAS la perte de proximité
-                // (BTN_TOOL_PEN).
+                // Contact = BTN_TOUCH enfoncé, ou pression >= seuil pour un
+                // stylet (certains drivers n'émettent pas BTN_TOUCH). Sans
+                // seuil, la proximité d'un vrai Wacom (pression > 0 en hover)
+                // déclencherait un tracé fantôme. La fin du stroke = plus de
+                // contact, PAS la perte de proximité (BTN_TOOL_PEN).
                 EventType::SYNCHRONIZATION => {
-                    let contact = btn_touch || (is_pen && pressure > 0.0);
+                    let contact = is_contact(btn_touch, is_pen, pressure);
                     if contact && !down {
                         down = true;
                         just_started = true;
@@ -195,4 +209,27 @@ fn read_loop(path: String, tx: Sender<TabletEvent>, ctx: egui::Context) {
         }
     }
     eprintln!("tablette: fin de lecture de {}", path);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn contact_bouton_touch() {
+        assert!(is_contact(true, false, 0.0));
+        assert!(is_contact(true, true, 0.0));
+        assert!(!is_contact(false, false, 1.0), "touchpad sans BTN_TOUCH : pas de contact");
+    }
+
+    #[test]
+    fn stylet_hover_ne_fait_pas_contact_mais_contact_reel_si() {
+        // Proximité Wacom (pression faible, pas de BTN_TOUCH) : hover, pas de tracé.
+        assert!(!is_contact(false, true, 0.0));
+        assert!(!is_contact(false, true, 0.3));
+        assert!(!is_contact(false, true, PEN_PRESSURE_CONTACT - 0.01));
+        // Contact réel (pression franche, driver sans BTN_TOUCH) : tracé.
+        assert!(is_contact(false, true, 0.8));
+        assert!(is_contact(false, true, PEN_PRESSURE_CONTACT));
+    }
 }

@@ -1,0 +1,56 @@
+{
+ "arch": "onnet-iamon",
+ "source": "https://github.com/chunkyjasper/IAMhwr (weights.h5, CER ~6.2% IAM-OnDB)",
+ "input_features": 6,
+ "feature_names": [
+  "x",
+  "y",
+  "dx",
+  "dy",
+  "pen_down",
+  "pen_up"
+ ],
+ "convs": [
+  [
+   60,
+   7
+  ],
+  [
+   90,
+   5
+  ],
+  [
+   120,
+   5
+  ],
+  [
+   120,
+   3
+  ],
+  [
+   160,
+   3
+  ],
+  [
+   200,
+   3
+  ]
+ ],
+ "pool_after": [
+  2,
+  5
+ ],
+ "lstm_layers": 4,
+ "lstm_hidden": 60,
+ "bn_eps": 0.001,
+ "num_classes": 83,
+ "blank": 82,
+ "charset": "!\"\u0001\u0002&'/()[]*,-+. :;?0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
+ "preprocess": {
+  "slope_correction": true,
+  "normalize": true,
+  "down_cos": 0.975,
+  "resample_distance": 0.37,
+  "up_sample": 9
+ }
+}

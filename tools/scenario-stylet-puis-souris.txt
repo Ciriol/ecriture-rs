@@ -1,0 +1,41 @@
+# Scénario de test bout-en-bout pour uinput-pilot.
+# Reproduit le bug "après un contact stylet, la souris trace en hover" :
+#  1) un tracé au stylet virtuel (contact + mouvements + relâché),
+#  2) la souris bouge en hover -> aucun tracé ne doit apparaître,
+#  3) un clic-maintient-relâche souris -> un seul tracé.
+#
+# Lancer (app lancée en parallèle) :
+#   cargo run --release --bin uinput-pilot -- tools/scenario-stylet-puis-souris.txt
+#
+# Ajuste `screen` à la résolution réelle de ton écran (ex. 2560 1440).
+
+screen 1920 1080
+
+# --- 1) tracé au stylet ---
+pen
+pmove 760 440
+pdown 0.8
+pmove 800 450
+pmove 840 470
+pmove 880 460
+pup
+sleep 300
+
+# --- 2) hover souris : rien ne doit être tracé ---
+mouse
+mmove 120 40
+mmove 120 40
+sleep 300
+
+# --- 3) clic-maintient-relâche : un seul tracé ---
+mmove -240 -80
+mdown
+mmove 60 0
+mmove 60 25
+mmove 60 -10
+mup
+sleep 200
+
+# --- 4) encore du hover après le clic : rien ---
+mmove 100 60
+mmove -50 30

@@ -78,6 +78,18 @@ pub fn ctc_greedy_decode(
     out
 }
 
+/// `logaddexp(a, b) = ln(e^a + e^b)`, stable (indispensable en log-space).
+fn logaddexp(a: f64, b: f64) -> f64 {
+    if a == f64::NEG_INFINITY {
+        return b;
+    }
+    if b == f64::NEG_INFINITY {
+        return a;
+    }
+    let m = a.max(b);
+    m + ((a - m).exp() + (b - m).exp()).ln()
+}
+
 /// Décodage CTC par beam search (prefix beam) sur des log-probabilités
 /// [T, C] (sortie log_softmax du modèle). Retourne les `nbest` meilleures
 /// hypothèses (texte, log-probabilité CTC totale) triées par score décroissant.
@@ -91,61 +103,116 @@ pub fn ctc_beam_decode_nbest(
     nbest: usize,
     blank: usize,
 ) -> Vec<(String, f64)> {
+    ctc_beam_decode_nbest_lm(logits, width, height, charset, beam_size, nbest, blank, None)
+}
+
+/// Beam search CTC (prefix beam, Hwang/Graves) en **log-space**, avec
+/// **shallow fusion d'un LM de caractères** optionnel — reprend
+/// githubharald/CTCDecoder (`beam_search` + `apply_lm`) : chaque extension de
+/// préfixe par un caractère `c` ajoute `lm_weight * ln P(c | dernier char)` au
+/// score du beam ; en fin de beam, le score LM est normalisé par la longueur
+/// du préfixe (`BeamList.normalize` de CTCDecoder) pour le classement final
+/// des N-best. Le score retourné reste la log-probabilité CTC pure
+/// (`logaddexp(pb, pnb)`), pour rester compatible avec `rescore_nbest`.
+///
+/// Pendant le beam, le tri se fait sur `logaddexp(pb, pnb) + lm` (brut, comme
+/// CTCDecoder) ; en fin, sur `logaddexp(pb, pnb) + lm / len`.
+pub fn ctc_beam_decode_nbest_lm(
+    logits: &[f32],
+    width: usize,
+    height: usize,
+    charset: &[char],
+    beam_size: usize,
+    nbest: usize,
+    blank: usize,
+    lm: Option<(&crate::charlm::CharLm, f64)>,
+) -> Vec<(String, f64)> {
     use std::collections::HashMap;
-    // beam: préfixe (classes) -> (proba se terminant par blank, proba non-blank)
+    // Entrée de beam en log-space : pb = chemins se terminant par blank,
+    // pnb = chemins se terminant par un non-blank, lm = score LM accumulé.
+    #[derive(Clone, Copy)]
+    struct BE {
+        pb: f64,
+        pnb: f64,
+        lm: f64,
+    }
+    let neg = f64::NEG_INFINITY;
     let beam_w = beam_size.max(nbest).max(1);
-    let mut beam: HashMap<Vec<usize>, (f64, f64)> = HashMap::new();
-    beam.insert(Vec::new(), (1.0, 0.0));
+    let mut beam: HashMap<Vec<usize>, BE> = HashMap::new();
+    beam.insert(Vec::new(), BE { pb: 0.0, pnb: neg, lm: 0.0 });
     for t in 0..width {
-        let mut next: HashMap<Vec<usize>, (f64, f64)> = HashMap::new();
-        for (prefix, &(pb, pnb)) in &beam {
+        let mut next: HashMap<Vec<usize>, BE> = HashMap::new();
+        for (prefix, &e) in &beam {
+            // blank -> préfixe inchangé
+            let lp = logits[t * height + blank] as f64;
+            if lp > -40.0 {
+                let cur = next
+                    .entry(prefix.clone())
+                    .or_insert(BE { pb: neg, pnb: neg, lm: e.lm });
+                cur.pb = logaddexp(cur.pb, logaddexp(e.pb, e.pnb) + lp);
+            }
             for c in 0..height {
+                if c == blank {
+                    continue;
+                }
                 let lp = logits[t * height + c] as f64;
-                if lp < -25.0 {
+                if lp < -30.0 {
                     continue; // classe quasi impossible à ce pas de temps
                 }
-                let p = lp.exp();
-                if c == blank {
-                    let e = next.entry(prefix.clone()).or_insert((0.0, 0.0));
-                    e.0 += (pb + pnb) * p;
-                } else if prefix.last() == Some(&c) {
+                let prev_char = prefix.last().and_then(|&i| charset.get(i).copied());
+                let new_char = charset.get(c).copied();
+                let lm_add = match (lm, new_char) {
+                    (Some((l, w)), Some(ch)) => w * l.logp(prev_char, ch),
+                    _ => 0.0,
+                };
+                if prefix.last() == Some(&c) {
                     // c identique au dernier caractère du préfixe : s'il était
                     // précédé d'un blank (pb), il forme un nouveau caractère
-                    // identique (séparé par le blank) -> on étend ; sinon il
-                    // est collé au précédent et absorbé -> préfixe inchangé.
+                    // identique (séparé par le blank) -> on étend (avec LM) ;
+                    // sinon il est collé au précédent et absorbé -> préfixe
+                    // inchangé (pas de nouveau caractère, pas de LM).
                     let mut ext = prefix.clone();
                     ext.push(c);
-                    let e = next.entry(ext).or_insert((0.0, 0.0));
-                    e.1 += pb * p;
-                    let e = next.entry(prefix.clone()).or_insert((0.0, 0.0));
-                    e.1 += pnb * p;
+                    let cur = next
+                        .entry(ext)
+                        .or_insert(BE { pb: neg, pnb: neg, lm: e.lm + lm_add });
+                    cur.pnb = logaddexp(cur.pnb, e.pb + lp);
+                    let cur = next
+                        .entry(prefix.clone())
+                        .or_insert(BE { pb: neg, pnb: neg, lm: e.lm });
+                    cur.pnb = logaddexp(cur.pnb, e.pnb + lp);
                 } else {
                     let mut ext = prefix.clone();
                     ext.push(c);
-                    let e = next.entry(ext).or_insert((0.0, 0.0));
-                    e.1 += (pb + pnb) * p;
+                    let cur = next
+                        .entry(ext)
+                        .or_insert(BE { pb: neg, pnb: neg, lm: e.lm + lm_add });
+                    cur.pnb = logaddexp(cur.pnb, logaddexp(e.pb, e.pnb) + lp);
                 }
             }
         }
-        let mut v: Vec<(Vec<usize>, (f64, f64))> = next.into_iter().collect();
+        // Tri intermédiaire : score brut CTC + LM (non normalisé), comme
+        // CTCDecoder qui trie sur pr_total + pr_text à chaque pas de temps.
+        let mut v: Vec<(Vec<usize>, BE)> = next.into_iter().collect();
         v.sort_by(|a, b| {
-            (b.1 .0 + b.1 .1)
-                .partial_cmp(&(a.1 .0 + a.1 .1))
-                .unwrap_or(std::cmp::Ordering::Equal)
+            let sa = logaddexp(a.1.pb, a.1.pnb) + a.1.lm;
+            let sb = logaddexp(b.1.pb, b.1.pnb) + b.1.lm;
+            sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
         });
         beam = v.into_iter().take(beam_w).collect();
     }
-    let mut v: Vec<(Vec<usize>, (f64, f64))> = beam.into_iter().collect();
+    // Classement final des N-best : LM normalisé par la longueur du préfixe.
+    let mut v: Vec<(Vec<usize>, BE)> = beam.into_iter().collect();
     v.sort_by(|a, b| {
-        (b.1 .0 + b.1 .1)
-            .partial_cmp(&(a.1 .0 + a.1 .1))
-            .unwrap_or(std::cmp::Ordering::Equal)
+        let sa = logaddexp(a.1.pb, a.1.pnb) + a.1.lm / a.0.len().max(1) as f64;
+        let sb = logaddexp(b.1.pb, b.1.pnb) + b.1.lm / b.0.len().max(1) as f64;
+        sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
     });
     v.truncate(nbest.max(1));
     v.into_iter()
-        .map(|(p, (pb, pnb))| {
+        .map(|(p, e)| {
             let text = p.iter().filter_map(|&i| charset.get(i)).collect::<String>();
-            (text, pb + pnb)
+            (text, logaddexp(e.pb, e.pnb))
         })
         .collect()
 }
@@ -196,6 +263,12 @@ pub struct DecodeOptions {
     pub lm_weight: f64,
     /// Lexique de langue ; `None` = pas de rescoring.
     pub lexicon: Option<crate::lexicon::Lexicon>,
+    /// Poids du LM de caractères (shallow fusion pendant le beam CTC,
+    /// inspiré de githubharald/CTCDecoder) ; 0.0 = désactivé.
+    pub char_lm_weight: f64,
+    /// LM de caractères ; `None` = construit depuis le lexique actif (si
+    /// `char_lm_weight > 0`) au chargement du reconnaisseur.
+    pub char_lm: Option<crate::charlm::CharLm>,
 }
 
 impl Default for DecodeOptions {
@@ -205,7 +278,20 @@ impl Default for DecodeOptions {
             nbest: 8,
             lm_weight: 2.0,
             lexicon: Some(crate::lexicon::Lexicon::embedded_fr()),
+            char_lm_weight: 0.4,
+            char_lm: None,
         }
+    }
+}
+
+/// Si `char_lm_weight > 0` et pas de LM fourni, construit le LM de caractères
+/// depuis le lexique actif, restreint au charset du modèle.
+fn ensure_char_lm(opts: &mut DecodeOptions, charset: &[char]) {
+    if opts.char_lm.is_none() && opts.char_lm_weight > 0.0 {
+        opts.char_lm = opts
+            .lexicon
+            .as_ref()
+            .map(|lex| crate::charlm::CharLm::from_lexicon(lex, charset));
     }
 }
 
@@ -288,6 +374,8 @@ impl CrnnRecognizer {
                 num_classes
             );
         }
+        let mut opts = opts;
+        ensure_char_lm(&mut opts, &charset);
         Ok(Self {
             backend: Backend::Sachin(model),
             blank_id: 0,
@@ -315,6 +403,8 @@ impl CrnnRecognizer {
         let model = crate::doctr::DoctrCrnn::load(pth_path, num_classes, hidden_size, device)
             .with_context(|| format!("chargement du modèle doctR {}", pth_path.display()))?;
         let (charset, blank_id) = crate::doctr::doctr_charset(&cfg.vocab, num_classes);
+        let mut opts = opts;
+        ensure_char_lm(&mut opts, &charset);
         let mean = [
             cfg.mean.first().copied().unwrap_or(0.5),
             cfg.mean.get(1).copied().unwrap_or(0.5),
@@ -350,6 +440,8 @@ impl CrnnRecognizer {
         let num_classes = charset.len();
         let model = crate::pylaia::PylaiaCrnn::load(pth_path, num_classes, 256, 3, device)
             .with_context(|| format!("chargement du modèle PyLaIA {}", pth_path.display()))?;
+        let mut opts = opts;
+        ensure_char_lm(&mut opts, &charset);
         Ok(Self {
             backend: Backend::Pylaia(model),
             blank_id,
@@ -363,12 +455,18 @@ impl CrnnRecognizer {
     }
 
     /// Décodage d'une séquence de log-probabilités [T, C] : beam CTC N-best
-    /// puis rescoring par le lexique si activé.
+    /// (avec shallow fusion du LM de caractères si activé) puis rescoring
+    /// par le lexique de mots si activé.
     fn decode(&self, flat: &[f32], t: usize, c: usize) -> String {
         if self.opts.beam_size <= 1 {
             return ctc_greedy_decode(flat, t, c, &self.charset, self.blank_id);
         }
-        let nbest = ctc_beam_decode_nbest(
+        let lm = self
+            .opts
+            .char_lm
+            .as_ref()
+            .map(|l| (l, self.opts.char_lm_weight));
+        let nbest = ctc_beam_decode_nbest_lm(
             flat,
             t,
             c,
@@ -376,6 +474,7 @@ impl CrnnRecognizer {
             self.opts.beam_size,
             self.opts.nbest,
             self.blank_id,
+            lm,
         );
         match &self.opts.lexicon {
             Some(lex) if self.opts.lm_weight > 0.0 && nbest.len() > 1 => {
@@ -503,6 +602,116 @@ impl Recognizer for MockRecognizer {
     }
 }
 
+/// Reconnaissance d'un chiffre isolé (0-9) par le classifieur de régression
+/// logistique softmax entraîné sur MNIST (src/digits.rs, inspiré de
+/// sktan888/handwriting_recognition_logistic_regression). Backend autonome,
+/// sélectionnable dans le menu de l'UI : l'entrée est rendue (ou redimensionnée)
+/// en 28x28.
+pub struct DigitRecognizer {
+    clf: crate::digits::DigitClassifier,
+    /// Dernière image 28x28 envoyée au classifieur (debug UI).
+    last_input: Option<GrayImage>,
+}
+
+impl DigitRecognizer {
+    pub fn new(clf: crate::digits::DigitClassifier) -> Self {
+        Self {
+            clf,
+            last_input: None,
+        }
+    }
+
+    /// Classifieur embarqué (`assets/digits-lr.f32`).
+    pub fn embedded() -> Self {
+        Self::new(crate::digits::DigitClassifier::embedded())
+    }
+}
+
+impl Recognizer for DigitRecognizer {
+    fn recognize(&mut self, img: &GrayImage) -> Result<String> {
+        let small = image::imageops::resize(
+            img,
+            crate::digits::MNIST_SIZE,
+            crate::digits::MNIST_SIZE,
+            image::imageops::FilterType::Triangle,
+        );
+        self.last_input = Some(small.clone());
+        let (d, _proba, _all) = self.clf.predict(&small);
+        Ok(d.to_string())
+    }
+
+    fn recognize_strokes(&mut self, strokes: &[crate::ink::Stroke]) -> Result<String> {
+        let img = crate::digits::render_strokes_28(strokes);
+        self.last_input = Some(img.clone());
+        let (d, _proba, _all) = self.clf.predict(&img);
+        Ok(d.to_string())
+    }
+
+    fn last_input_image(&self) -> Option<&GrayImage> {
+        self.last_input.as_ref()
+    }
+}
+
+/// Reconnaissance hybride CRNN + classifieur de chiffres isolés : quand les
+/// strokes forment un seul glyphe compact (`digits::looks_like_single_glyph`),
+/// le LR-MNIST prédit un chiffre ; si sa confiance softmax >= `digit_threshold`,
+/// c'est le résultat, sinon on retombe sur le reconnaisseur interne (CRNN,
+/// lignes de texte). Améliore la détection des chiffres isolés (dates,
+/// montants, numéros) où le CRNN confond 1/l, 0/O, 5/S...
+pub struct HybridRecognizer {
+    inner: Box<dyn Recognizer>,
+    digits: Option<crate::digits::DigitClassifier>,
+    digit_threshold: f32,
+}
+
+impl HybridRecognizer {
+    pub fn new(
+        inner: Box<dyn Recognizer>,
+        digits: Option<crate::digits::DigitClassifier>,
+        digit_threshold: f32,
+    ) -> Self {
+        Self {
+            inner,
+            digits,
+            digit_threshold,
+        }
+    }
+
+    /// Le classifieur de chiffres est-il actif ?
+    pub fn digits_active(&self) -> bool {
+        self.digits.is_some()
+    }
+
+    pub fn digit_threshold(&self) -> f32 {
+        self.digit_threshold
+    }
+}
+
+impl Recognizer for HybridRecognizer {
+    fn recognize(&mut self, img: &GrayImage) -> Result<String> {
+        // Image fournie telle quelle (ligne de texte) : pas d'heuristique de
+        // glyphe possible -> le reconnaisseur interne.
+        self.inner.recognize(img)
+    }
+
+    fn recognize_strokes(&mut self, strokes: &[crate::ink::Stroke]) -> Result<String> {
+        if let Some(clf) = &self.digits {
+            if crate::digits::looks_like_single_glyph(strokes) {
+                let img = crate::digits::render_strokes_28(strokes);
+                let (digit, proba, _all) = clf.predict(&img);
+                if proba >= self.digit_threshold {
+                    return Ok(digit.to_string());
+                }
+            }
+        }
+        self.inner.recognize_strokes(strokes)
+    }
+
+    fn last_input_image(&self) -> Option<&GrayImage> {
+        self.inner.last_input_image()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -553,6 +762,61 @@ mod tests {
     }
 
     #[test]
+    fn logaddexp_stable() {
+        assert_eq!(logaddexp(f64::NEG_INFINITY, 3.0), 3.0);
+        assert_eq!(logaddexp(3.0, f64::NEG_INFINITY), 3.0);
+        assert!((logaddexp(0.0, 0.0) - 2f64.ln()).abs() < 1e-12);
+        // pas de sous-flux avec de très petits log-probs
+        assert!((logaddexp(-1000.0, -1001.0) - (-1000.0 + (1.0 + (-1f64).exp()).ln())).abs() < 1e-9);
+    }
+
+    #[test]
+    fn beam_lm_char_fait_pencher_vers_le_bigram_vu() {
+        // charset: 0=blank, 1='a', 2='b', 3='c'
+        let charset: Vec<char> = vec!['\u{0}', 'a', 'b', 'c'];
+        // LM jouet : seul "ab" a été vu -> P(b|a) = 1, P(c|a) = backoff faible.
+        let lm = crate::charlm::CharLm::from_words(&["ab".to_string()], &charset);
+        // t0: 'a' fort ; t1: 'c' un peu plus fort que 'b' en CTC pur ; t2: blank.
+        let (t, c) = (3usize, 4usize);
+        let mut l = vec![-10.0f32; t * c];
+        l[0 * c + 1] = 0.0;
+        l[1 * c + 3] = 0.0;
+        l[1 * c + 2] = -0.1;
+        l[2 * c + 0] = 0.0;
+        // Sans LM : le CTC pur gagne -> "ac".
+        let nbest = ctc_beam_decode_nbest_lm(&l, t, c, &charset, 8, 4, 0, None);
+        assert_eq!(nbest[0].0, "ac");
+        // Avec un LM suffisant : le bigram a->b vu fait gagner "ab".
+        let nbest = ctc_beam_decode_nbest_lm(&l, t, c, &charset, 8, 4, 0, Some((&lm, 2.0)));
+        assert_eq!(nbest[0].0, "ab");
+        // Le score retourné reste la log-prob CTC pure (rescore_nbest inchangé).
+        assert!(nbest[0].1 <= 0.0);
+    }
+
+    #[test]
+    fn ensure_char_lm_construit_depuis_le_lexique() {
+        let charset: Vec<char> = vec!['\u{0}', 'a', 'c', 'e', 'h', 'l', 't', ' '];
+        let mut opts = DecodeOptions {
+            char_lm_weight: 0.4,
+            lexicon: Some(crate::lexicon::Lexicon::from_text("le\nchat\nle\n")),
+            ..Default::default()
+        };
+        ensure_char_lm(&mut opts, &charset);
+        let lm = opts.char_lm.as_ref().expect("LM construit depuis le lexique");
+        assert!(lm.logp(Some('l'), 'e') > lm.logp(Some('l'), 'c'));
+        // poids 0 -> pas de LM
+        let mut opts2 = DecodeOptions { char_lm_weight: 0.0, ..opts.clone() };
+        opts2.char_lm = None;
+        ensure_char_lm(&mut opts2, &charset);
+        assert!(opts2.char_lm.is_none());
+        // pas de lexique -> pas de LM
+        let mut opts3 = DecodeOptions { lexicon: None, ..opts.clone() };
+        opts3.char_lm = None;
+        ensure_char_lm(&mut opts3, &charset);
+        assert!(opts3.char_lm.is_none());
+    }
+
+    #[test]
     fn ctc_beam_prefere_la_sequence_la_plus_probable() {
         // Deux hypothèses proches : "ab" (fort à t0/t1, faible à t2) vs "aab".
         // Le beam doit choisir "ab".
@@ -596,6 +860,79 @@ mod tests {
         assert_eq!(Norm::NegOneOne.apply(1.0), 1.0);
         assert_eq!(Norm::NegOneOne.apply(0.0), -1.0);
         assert_eq!(Norm::ZeroOne.apply(0.5), 0.5);
+    }
+
+    /// Stroke "1" : trait vertical isolé.
+    fn stroke_vertical() -> Vec<crate::ink::Stroke> {
+        use crate::ink::Point;
+        let mut s = crate::ink::Stroke::new();
+        for i in 0..=20 {
+            let r = i as f32 / 20.0;
+            s.push(Point {
+                x: 50.0 + r * 4.0,
+                y: 10.0 + r * 80.0,
+                t: r as f64,
+                pressure: 0.8,
+            });
+        }
+        vec![s]
+    }
+
+    /// Stroke "mot" : longue ligne horizontale (plusieurs glyphes).
+    fn stroke_mot() -> Vec<crate::ink::Stroke> {
+        use crate::ink::Point;
+        let mut s = crate::ink::Stroke::new();
+        for i in 0..=40 {
+            let r = i as f32 / 40.0;
+            s.push(Point {
+                x: 10.0 + r * 300.0,
+                y: 50.0 + (r * 8.0).sin() * 5.0,
+                t: r as f64,
+                pressure: 0.8,
+            });
+        }
+        vec![s]
+    }
+
+    #[test]
+    fn hybride_glyphe_isole_passe_par_le_lr_mot_par_le_crnn() {
+        // Seuil très bas : même avec des poids nuls (proba uniforme 0.1), le
+        // LR répond un chiffre pour un glyphe isolé.
+        let clf = crate::digits::DigitClassifier::embedded();
+        let mut rec = HybridRecognizer::new(Box::new(MockRecognizer), Some(clf), 0.05);
+        assert!(rec.digits_active());
+        let out = rec.recognize_strokes(&stroke_vertical()).unwrap();
+        assert_eq!(out.chars().count(), 1);
+        assert!(out.chars().next().unwrap().is_ascii_digit(), "attendu un chiffre, reçu {out:?}");
+        // Un "mot" (ligne longue) reste délégué au CRNN/mock.
+        assert_eq!(rec.recognize_strokes(&stroke_mot()).unwrap(), "[reconnaissance simulée]");
+    }
+
+    #[test]
+    fn hybride_sans_classifieur_delegue_toujours() {
+        let mut rec = HybridRecognizer::new(Box::new(MockRecognizer), None, 0.85);
+        assert!(!rec.digits_active());
+        assert_eq!(rec.recognize_strokes(&stroke_vertical()).unwrap(), "[reconnaissance simulée]");
+    }
+
+    #[test]
+    fn digit_recognizer_reconnait_echantillons_mnist() {
+        let mut rec = DigitRecognizer::embedded();
+        let samples = crate::digits::embedded_samples();
+        assert!(samples.len() >= 50);
+        let mut ok = 0;
+        for (label, px) in &samples {
+            let img = GrayImage::from_fn(crate::digits::MNIST_SIZE, crate::digits::MNIST_SIZE, |x, y| {
+                image::Luma([px[(y * crate::digits::MNIST_SIZE + x) as usize]])
+            });
+            if rec.recognize(&img).unwrap() == label.to_string() {
+                ok += 1;
+            }
+        }
+        let acc = ok as f32 / samples.len() as f32;
+        assert!(acc >= 0.80, "accuracy DigitRecognizer {acc} < 0.80");
+        // last_input_image exposé pour le debug
+        assert!(rec.last_input_image().is_some());
     }
 
     fn levenshtein(a: &[char], b: &[char]) -> usize {
@@ -654,12 +991,16 @@ mod tests {
             nbest: 1,
             lm_weight: 0.0,
             lexicon: None,
+            char_lm_weight: 0.0,
+            char_lm: None,
         });
         let mut rec_beam = mk(DecodeOptions {
             beam_size: 16,
             nbest: 8,
             lm_weight: 0.0,
             lexicon: None,
+            char_lm_weight: 0.0,
+            char_lm: None,
         });
         // Calibration du poids LM sur plusieurs valeurs (lexique anglais, les
         // labels IAM étant en anglais).
@@ -674,6 +1015,8 @@ mod tests {
                         nbest: 8,
                         lm_weight: w,
                         lexicon: lex_en.clone(),
+                        char_lm_weight: 0.0,
+                        char_lm: None,
                     }),
                 )
             })
@@ -743,6 +1086,8 @@ mod tests {
                     nbest: 8,
                     lm_weight,
                     lexicon: Some(crate::lexicon::Lexicon::embedded_fr()),
+                    char_lm_weight: 0.0,
+                    char_lm: None,
                 },
                 &device,
             )

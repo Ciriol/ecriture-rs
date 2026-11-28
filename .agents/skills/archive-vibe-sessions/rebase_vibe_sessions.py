@@ -14,9 +14,13 @@ Un commit = une session (sessions/<slug>/{RESUME.md, journal.jsonl, meta.json,
 records/}) + index global sessions/{README.md, index.json} (catégorie + branche).
 Dates auteur/commiter = start_time. Secrets masqués (***REDACTED***).
 
-Sources des sessions : branches locales vibe* + origin/vibe* (autres machines)
-+ EXPORT_DIR (défaut /tmp/vibe-sessions-export, produit par
+Sources des sessions : branches locales vibe* + <archive-remote>/vibe* (autres
+machines) + EXPORT_DIR (défaut /tmp/vibe-sessions-export, produit par
 `session-export --export <id> --out EXPORT_DIR`).
+
+Remote d'archivage : `git config vibe.archiveRemote` (défaut : `vibe-archive`
+s'il existe, sinon `origin`) — dépôt PRIVÉ dédié (ex. Ciriol/vibe-sessions),
+jamais le dépôt public du projet.
 
 Plumbing git uniquement : le worktree n'est jamais modifié.
 """
@@ -82,6 +86,20 @@ def git(args, env_extra=None, binary=False, input=None):
     return r.stdout if binary else r.stdout.decode().strip()
 
 
+def _archive_remote():
+    """Remote privé d'archivage : git config vibe.archiveRemote, sinon
+    `vibe-archive` s'il existe, sinon `origin` (rétrocompatibilité)."""
+    r = subprocess.run(["git", "-C", REPO, "config", "--get", "vibe.archiveRemote"],
+                       capture_output=True)
+    if r.returncode == 0 and r.stdout.decode().strip():
+        return r.stdout.decode().strip()
+    remotes = git(["remote"]).split()
+    return "vibe-archive" if "vibe-archive" in remotes else "origin"
+
+
+ARCHIVE_REMOTE = _archive_remote()
+
+
 def scrub(data):
     for rx in PATTERNS:
         data = rx.sub(REDACTED, data)
@@ -140,9 +158,9 @@ def collect():
         except Exception:
             pass
 
-    # branches locales vibe* puis distantes origin/vibe* (autres machines)
+    # branches locales vibe* puis distantes <archive-remote>/vibe* (autres machines)
     refs = [b for b in git(["for-each-ref", "--format=%(refname)", "refs/heads/vibe*"]).splitlines()]
-    refs += [b for b in git(["for-each-ref", "--format=%(refname)", "refs/remotes/origin/vibe*"]).splitlines()]
+    refs += [b for b in git(["for-each-ref", "--format=%(refname)", f"refs/remotes/{ARCHIVE_REMOTE}/vibe*"]).splitlines()]
     for b in refs:
         if b.endswith("/session-") or "/session-" in b:
             continue

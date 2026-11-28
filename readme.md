@@ -161,9 +161,11 @@ Deux machines, deux rôles, sessions archivées ensemble dans l'arbre `vibe` :
 | **yogarch** (`192.168.1.34`, plateforme cible, ~8 Go RAM) | interface (fenêtre, tablette evdev, souris/hover), tests directs sur la cible via `uinput-pilot` + record/replay | branche `vibe-interface` |
 
 - Le hook `session_end` archive chaque session dans sa branche par catégorie
-  (mots-clés du titre) ; `git fetch origin` ramène les sessions de l'autre
-  machine, le rebuild les fusionne par date dans `vibe` / `vibe-interface` /
-  `vibe-reconnaissance`.
+  (mots-clés du titre) ; `git fetch vibe-archive` ramène les sessions de
+  l'autre machine, le rebuild les fusionne par date dans `vibe` /
+  `vibe-interface` / `vibe-reconnaissance` — poussées vers le dépôt **privé**
+  `Ciriol/vibe-sessions` (remote `vibe-archive`, `git config
+  vibe.archiveRemote`), jamais vers le dépôt public `origin`.
 - SSH vers yogarch : alias `yogarch` (`~/.ssh/config`) + clé
   `~/.ssh/id_perso_yogarch` (ed25519, générée sur yogarch puis privée
   rapatriée ici, 600 ; la privée a été supprimée de yogarch). Repli mot de
@@ -251,25 +253,27 @@ Combiner les deux : lancer l'app avec `--record-input`, injecter un scénario
 avec `uinput-pilot`, puis rejouer le JSONL — le bug est figé et rejouable à
 l'identique (couvert par les tests `record_puis_replay_*`).
 
-## Archiver les sessions Vibe (branche `vibe/`, sans code)
+## Archiver les sessions Vibe (arbre `vibe`, dépôt privé, sans code)
 
-`src/bin/session-export.rs` exporte les sessions journalisées localement
-(`~/.vibe/logs/session/unified/<id>/`) dans une branche par session sous le
-namespace `vibe/` — **aucun fichier du projet n'y est poussé** (vérifié) :
+Le hook `session_end` (`.vibe/hooks.toml`, skill
+`.agents/skills/archive-vibe-sessions`) archive les sessions journalisées
+localement (`~/.vibe/logs/session/unified/<id>/`) dans l'arbre `vibe` — tronc
+général `vibe` + branches `vibe-interface` / `vibe-reconnaissance`, un commit
+par session, ordonné par `start_time`, secrets masqués — puis pousse
+(`--force-with-lease`) vers le dépôt **privé** `Ciriol/vibe-sessions` via le
+remote `vibe-archive`. **Aucun fichier du projet n'y est poussé** (vérifié :
+`git ls-tree -r <branche> | grep -v '^sessions/'` → vide). Chaque session :
+`sessions/<slug>/{RESUME.md, journal.jsonl, meta.json, records/}` + index
+global `sessions/{README.md,index.json}`. Le worktree courant n'est jamais
+modifié (plumbing git sur index temporaire). Export manuel vers un dossier
+temporaire (jamais `--branch`, réservé au passé) :
 
 ```bash
-cargo run --bin session-export -- --list                          # sessions trouvées
-cargo run --bin session-export -- --export last --branch --push   # branche vibe/session-<date>-<slug>
-cargo run --bin session-export -- --export all --branch           # toutes les sessions
-cargo run --bin session-export -- --export <id> --no-raw          # RESUME.md seul, sans journal brut
+cargo run --bin session-export -- --list                      # sessions trouvées
+cargo run --bin session-export -- --export <id> --out /tmp/vibe-sessions-export
+python3 .agents/skills/archive-vibe-sessions/rebase_vibe_sessions.py /tmp/vibe-sessions-export
+git push --force-with-lease vibe-archive vibe vibe-interface vibe-reconnaissance
 ```
-
-Chaque branche `vibe/session-<slug>` contient `sessions/<slug>/{RESUME.md
-(généré : messages, commandes, outils, records --record-input copiés),
-journal.jsonl, meta.json}` + l'index global `sessions/{README.md,index.json}`.
-Pousser tout l'arbre : `git push origin 'refs/heads/vibe/*'`. Le worktree
-courant n'est jamais modifié (plumbing git : `hash-object`/`update-index`/
-`commit-tree` sur index temporaire).
 
 ## Roadmap
 

@@ -40,8 +40,29 @@ vibe (tronc général, chrono)  ──► vibe-interface
    (`ghp_…`, `github_pat_…`, `sk-…`, `AKIA…`, `AIza…`, `xox…`, JWT) est remplacé
    par `***REDACTED***` avant le push ; `--scan` vérifie.
 4. **Ordre chronologique** dans chaque branche (start_time, pas l'ordre de push).
-5. **Push** : `git push --force-with-lease origin vibe vibe-interface vibe-reconnaissance`
-   (+ suppression des éventuelles anciennes `vibe/session-*` distantes).
+5. **Push** : `git push --force-with-lease "$REMOTE" vibe vibe-interface vibe-reconnaissance`
+   (+ suppression des éventuelles anciennes `vibe/session-*` distantes), où
+   `REMOTE` est le **remote d'archivage privé** (voir section ci-dessous) —
+   jamais `origin` (dépôt public du projet).
+
+## Remote d'archivage — dépôt PRIVÉ
+
+Les sessions ne vont **jamais** dans le dépôt public du projet : elles sont
+poussées vers un dépôt privé dédié via le remote `vibe-archive`
+(ex. `Ciriol/vibe-sessions`, visibilité *private*) :
+
+```bash
+git remote add vibe-archive https://github.com/Ciriol/vibe-sessions.git
+git config vibe.archiveRemote vibe-archive      # lu par le script et les hooks
+git push vibe-archive vibe vibe-interface vibe-reconnaissance
+# une fois la bascule faite, supprimer les anciennes branches PUBLIQUES :
+git push origin --delete vibe vibe-interface vibe-reconnaissance
+```
+
+Résolution du remote effectif (script `rebase_vibe_sessions.py` + hook
+`session_end`) : `git config vibe.archiveRemote` → sinon `vibe-archive` s'il
+existe → sinon `origin` (rétrocompatibilité). Ne pas supprimer le remote
+`vibe-archive` des clones du projet.
 6. **Filtrage par projet** : seules les sessions **en rapport avec ce projet**
    (cwd = racine du dépôt ou sous-dossier) sont exportées.
 7. **Jamais de branche `vibe/session-*`** : git interdit `refs/heads/vibe` et
@@ -52,7 +73,7 @@ vibe (tronc général, chrono)  ──► vibe-interface
 
 ```bash
 cd "$(git rev-parse --show-toplevel)"   # racine du clone (portable)
-git fetch --all --prune                 # récupère origin/vibe* (autres machines)
+git fetch --all --prune                 # récupère vibe-archive/vibe* (autres machines)
 
 # 1) exporter les sessions locales DU PROJET dans un dossier temporaire
 git worktree add /tmp/ecriture-main origin/main 2>/dev/null || true
@@ -80,8 +101,8 @@ for b in vibe vibe-interface vibe-reconnaissance; do
 done
 python3 .agents/skills/archive-vibe-sessions/rebase_vibe_sessions.py --scan   # 0 secret
 
-# 4) push
-git push --force-with-lease origin vibe vibe-interface vibe-reconnaissance
+# 4) push vers le dépôt PRIVÉ d'archivage (jamais origin, public)
+git push --force-with-lease vibe-archive vibe vibe-interface vibe-reconnaissance
 ```
 
 ## Fichiers support
@@ -104,7 +125,10 @@ git push --force-with-lease origin vibe vibe-interface vibe-reconnaissance
 git clone <url-du-dépôt> && cd ecriture-rs
 git checkout export-inkml        # branche portant le skill et les hooks projet
 # trust le dossier une fois : vibe --trust (ou /trusted-folders)
-git fetch origin                 # récupère vibe, vibe-interface, vibe-reconnaissance
+git fetch origin                 # code du projet
+git remote add vibe-archive https://github.com/Ciriol/vibe-sessions.git 2>/dev/null
+git config vibe.archiveRemote vibe-archive
+git fetch vibe-archive           # récupère vibe, vibe-interface, vibe-reconnaissance (privé)
 ```
 
 Dès la première session dans ce clone, les hooks projet s'activent : export des

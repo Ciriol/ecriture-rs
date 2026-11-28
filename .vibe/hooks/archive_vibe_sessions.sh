@@ -10,6 +10,13 @@
 
 REPO="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
 git -C "$REPO" remote get-url origin 2>/dev/null | grep -q 'ecriture-rs' || exit 0
+# Remote d'archivage PRIVÉ (dépôt dédié, ex. Ciriol/vibe-sessions) — jamais le
+# dépôt public origin : git config vibe.archiveRemote, sinon vibe-archive
+# s'il existe, sinon origin (rétrocompatibilité).
+REMOTE="$(git -C "$REPO" config --get vibe.archiveRemote 2>/dev/null)"
+if [ -z "$REMOTE" ]; then
+  if git -C "$REPO" remote | grep -qx 'vibe-archive'; then REMOTE=vibe-archive; else REMOTE=origin; fi
+fi
 SKILL="$REPO/.agents/skills/archive-vibe-sessions/rebase_vibe_sessions.py"
 [ -f "$SKILL" ] || exit 0
 cd "$REPO" || exit 0
@@ -41,9 +48,9 @@ fi
 
 # rebuild de l'arbre vibe (catégorisation + chrono + scrub secrets + scan final)
 if python3 "$SKILL" "$EXPORT_DIR"; then
-  git push --force-with-lease origin vibe vibe-interface vibe-reconnaissance
+  git push --force-with-lease "$REMOTE" vibe vibe-interface vibe-reconnaissance
   # supprime les éventuelles anciennes branches vibe/session-* distantes
-  for r in $(git ls-remote --heads origin 'refs/heads/vibe/session-*' | cut -f2); do
-    git push origin --delete "$r" 2>/dev/null
+  for r in $(git ls-remote --heads "$REMOTE" 'refs/heads/vibe/session-*' | cut -f2); do
+    git push "$REMOTE" --delete "$r" 2>/dev/null
   done
 fi

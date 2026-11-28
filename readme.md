@@ -43,7 +43,7 @@ montants, numéros) que le CRNN peut confondre (1/l, 0/O, 5/S) : accuracy
 **chiffres isolés** du menu déroulant reconnaît un glyphe unique avec ce LR.
 
 - Reconnaissance **incrémentale** : 0,6 s après la fin d'un tracé, seuls les nouveaux strokes sont reconnus et ajoutés au texte.
-- **Stylet Linux** : lu directement via evdev (`src/tablet.rs`) quand winit ne remonte rien ; contact détecté par `BTN_TOUCH`/pression, coordonnées normalisées depuis les bornes du périphérique, pression `ABS_PRESSURE` conservée dans chaque point.
+- **Stylet Linux** : lu directement via evdev (`src/tablet.rs`) quand winit ne remonte rien ; contact détecté par `BTN_TOUCH`/pression, coordonnées normalisées depuis les bornes du périphérique, pression `ABS_PRESSURE` conservée dans chaque point. Les coordonnées normalisées sont projetées sur le moniteur puis rapportées à la position réelle de la fenêtre (`viewport.inner_rect`) : en fenêtré, seule la zone physique de l'écran couverte par la fenêtre est dessinable (plein écran : identique à avant).
 - **Modèles** : 3 backends CRNN-CTC, tous chargés en pur Rust depuis un checkpoint torch (`pthrs`), inférence CPU via candle :
   - `Sachin-0001/crnn-iam-handwriting` (défaut, anglais, IAM) : `model.pth` + `vocab.json` + `config.json`
   - **PyLaIA `Teklia/pylaia-rimes` (français, CER ~4.5% sur RIMES)** : `weights.ckpt` + `syms.txt` — lancer avec `--repo Teklia/pylaia-rimes` (téléchargement auto HF) ou `--pth ~/modeles/pylaia-rimes/weights.ckpt` (détection auto via `syms.txt`)
@@ -150,6 +150,32 @@ ecriture-rs/
 │   └── to_safetensors.rs  convertit un .ckpt torch en .safetensors (f32/f16) pour partager les poids
 └── LICENSE.md
 ```
+
+## Organisation multi-machines (dev ↔ yogarch)
+
+Deux machines, deux rôles, sessions archivées ensemble dans l'arbre `vibe` :
+
+| Machine | Rôle | Sessions |
+|---|---|---|
+| poste de dev (32 Go RAM) | modèles de reconnaissance, conversions de poids, entraînements, tests de parité gourmands (`cargo test --release -- --ignored`) | branche `vibe-reconnaissance` |
+| **yogarch** (`192.168.1.34`, plateforme cible, ~8 Go RAM) | interface (fenêtre, tablette evdev, souris/hover), tests directs sur la cible via `uinput-pilot` + record/replay | branche `vibe-interface` |
+
+- Le hook `session_end` archive chaque session dans sa branche par catégorie
+  (mots-clés du titre) ; `git fetch origin` ramène les sessions de l'autre
+  machine, le rebuild les fusionne par date dans `vibe` / `vibe-interface` /
+  `vibe-reconnaissance`.
+- SSH vers yogarch : alias `yogarch` (`~/.ssh/config`) + clé
+  `~/.ssh/id_perso_yogarch` (ed25519, générée sur yogarch puis privée
+  rapatriée ici, 600 ; la privée a été supprimée de yogarch). Repli mot de
+  passe via askpass lisant `~/.vibe/archive-scrub-local.txt` (chmod 600,
+  hors dépôt, masqué dans l'archive vibe) — voir `archive-vibe-sessions`.
+- Pour lancer une tâche lourde sur yogarch : `ssh ciriol@192.168.1.34 'cd
+  ~/Projets/ecriture-rs && cargo test --release -- --ignored bench_iam'`.
+- Pilotage sans confirmation : wrappers `yog '<cmd>'` et `yog-scp <src> <dst>`
+  dans `~/.local/bin` (clé `id_perso_yogarch`, repli askpass), préfixes
+  auto-approuvés dans `~/.vibe/config.toml` `[tools.bash] allowlist`
+  (`yog`, `yog-scp`, `ssh yogarch`, `scp yogarch:`) — s'applique après
+  `/reload` ou à la prochaine session.
 
 ## Tests
 

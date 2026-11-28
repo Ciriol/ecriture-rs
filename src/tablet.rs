@@ -1,7 +1,8 @@
-//! Lecture directe des périphériques stylet / dalle tactile via evdev
-//! (`/dev/input/event*`). Sous Linux, winit peut ne remonter aucun
-//! événement du stylet à egui ; on lit donc le périphérique nous-mêmes
-//! dans un thread dédié et on injecte les points dans l'UI via un channel.
+//! Lecture directe du stylet via evdev (`/dev/input/event*`). Sous Linux,
+//! winit peut ne remonter aucun événement du stylet à egui ; on lit donc le
+//! périphérique nous-mêmes dans un thread dédié et on injecte les points dans
+//! l'UI via un channel. Seuls les stylets (BTN_TOOL_PEN) sont lus : touchpads
+//! et dalles tactiles remontent déjà via winit (souris/touch egui).
 //!
 //! Nécessite les droits de lecture sur /dev/input/event* (groupe `input`) :
 //! `sudo usermod -aG input $USER` puis re-login.
@@ -71,23 +72,15 @@ fn list_event_devices() -> Vec<String> {
     v
 }
 
-/// Un périphérique tablette : stylet (BTN_TOOL_PEN) ou dalle tactile (ABS_X/Y + BTN_TOUCH).
+/// Un périphérique à lire en evdev : UNIQUEMENT un stylet (BTN_TOOL_PEN).
+/// Les touchpads et dalles tactiles (ABS_X/Y + BTN_TOUCH) remontent déjà via
+/// winit (souris / touch egui) ; les relire en evdev en plus double le tracé —
+/// et un clickpad, où BTN_TOUCH reste actif dès qu'on pose le doigt pour
+/// déplacer le curseur, ferait tracer la « souris » sans aucun clic.
 fn is_tablet(dev: &Device) -> bool {
-    let has_pen = dev
-        .supported_keys()
+    dev.supported_keys()
         .map(|k| k.contains(KeyCode::BTN_TOOL_PEN))
-        .unwrap_or(false);
-    let has_abs_xy = dev
-        .supported_absolute_axes()
-        .map(|a| {
-            a.contains(AbsoluteAxisCode::ABS_X) && a.contains(AbsoluteAxisCode::ABS_Y)
-        })
-        .unwrap_or(false);
-    let has_touch = dev
-        .supported_keys()
-        .map(|k| k.contains(KeyCode::BTN_TOUCH))
-        .unwrap_or(false);
-    has_pen || (has_abs_xy && has_touch)
+        .unwrap_or(false)
 }
 
 /// Envoie un événement dans le channel ET réveille egui (request_repaint

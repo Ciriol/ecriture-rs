@@ -1794,6 +1794,41 @@ mod tests {
         assert!(app.strokes.is_empty());
     }
 
+    /// Régression « la souris trace sans clic » : après un clic-maintient-relâche
+    /// DANS le canvas, un simple mouvement de souris (hover) ne doit ni rouvrir
+    /// un stroke ni ajouter de points au stroke archivé.
+    #[test]
+    fn hover_apres_clic_dans_le_canvas_ne_trace_pas() {
+        let ctx = egui::Context::default();
+        let mut app = app_test();
+        run_frame(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(egui::pos2(400.0, 300.0)),
+                ptr_button(egui::pos2(400.0, 300.0), true),
+            ],
+        );
+        run_frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerMoved(egui::pos2(450.0, 320.0))],
+        );
+        run_frame(
+            &mut app,
+            &ctx,
+            vec![ptr_button(egui::pos2(450.0, 320.0), false)],
+        );
+        assert_eq!(app.strokes.len(), 1, "le clic doit archiver exactement 1 stroke");
+        let n = app.strokes[0].points.len();
+        // hover après le release
+        run_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(egui::pos2(500.0, 350.0))]);
+        run_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(egui::pos2(550.0, 370.0))]);
+        assert!(app.current.is_none(), "le hover a rouvert un stroke");
+        assert_eq!(app.strokes.len(), 1);
+        assert_eq!(app.strokes[0].points.len(), n, "le hover a ajouté des points au stroke archivé");
+    }
+
     #[test]
     fn clic_maintenu_puis_release_archive_un_stroke() {
         let ctx = egui::Context::default();

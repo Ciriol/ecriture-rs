@@ -43,7 +43,7 @@ montants, numéros) que le CRNN peut confondre (1/l, 0/O, 5/S) : accuracy
 **chiffres isolés** du menu déroulant reconnaît un glyphe unique avec ce LR.
 
 - Reconnaissance **incrémentale** : 0,6 s après la fin d'un tracé, seuls les nouveaux strokes sont reconnus et ajoutés au texte.
-- **Stylet Linux** : lu directement via evdev (`src/tablet.rs`) quand winit ne remonte rien ; contact détecté par `BTN_TOUCH`/pression, coordonnées normalisées depuis les bornes du périphérique, pression `ABS_PRESSURE` conservée dans chaque point.
+- **Stylet Linux** : lu directement via evdev (`src/tablet.rs`) quand winit ne remonte rien ; contact détecté par `BTN_TOUCH`/pression, coordonnées normalisées depuis les bornes du périphérique, pression `ABS_PRESSURE` conservée dans chaque point. Les coordonnées normalisées sont projetées sur le moniteur puis rapportées à la position réelle de la fenêtre (`viewport.inner_rect`) : en fenêtré, seule la zone physique de l'écran couverte par la fenêtre est dessinable (plein écran : identique à avant).
 - **Modèles** : 3 backends CRNN-CTC, tous chargés en pur Rust depuis un checkpoint torch (`pthrs`), inférence CPU via candle :
   - `Sachin-0001/crnn-iam-handwriting` (défaut, anglais, IAM) : `model.pth` + `vocab.json` + `config.json`
   - **PyLaIA `Teklia/pylaia-rimes` (français, CER ~4.5% sur RIMES)** : `weights.ckpt` + `syms.txt` — lancer avec `--repo Teklia/pylaia-rimes` (téléchargement auto HF) ou `--pth ~/modeles/pylaia-rimes/weights.ckpt` (détection auto via `syms.txt`)

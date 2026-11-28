@@ -445,8 +445,12 @@ impl InkApp {
     }
 
     /// Tracé au stylet lu directement via evdev (winit ne remonte pas
-    /// toujours le périphérique à egui). Coordonnées normalisées 0..1
-    /// de l'écran -> points UI via le viewport_rect.
+    /// toujours le périphérique à egui). Coordonnées normalisées 0..1 de
+    /// l'écran : projetées sur le moniteur entier (points écran via
+    /// `viewport.monitor_size`), puis rapportées à la position réelle de la
+    /// fenêtre sur l'écran (`viewport.inner_rect`). Fenêtré : seule la zone
+    /// physique couverte par la fenêtre est dessinable ; plein écran :
+    /// `inner_rect.min == (0,0)`, identique à l'ancien comportement.
     fn handle_tablet_events(&mut self, ctx: &egui::Context, rect: egui::Rect, now: f64) {
         let mut tablet_events = Vec::new();
         if let Some(rx) = &self.tablet_rx {
@@ -459,12 +463,19 @@ impl InkApp {
         }
         self.record_tablet(&tablet_events);
         self.last_tablet_event = now;
-        let screen = ctx.viewport_rect();
+        let (inner_rect, monitor_size) = ctx.input(|i| {
+            let vp = i.raw.viewports.get(&i.raw.viewport_id);
+            (vp.and_then(|v| v.inner_rect), vp.and_then(|v| v.monitor_size))
+        });
+        let inner = inner_rect.unwrap_or_else(|| ctx.viewport_rect());
+        let monitor = monitor_size.unwrap_or_else(|| inner.size());
+        let to_ui =
+            |x: f32, y: f32| egui::pos2(x * monitor.x - inner.min.x, y * monitor.y - inner.min.y);
         for ev in tablet_events {
             self.tablet_count += 1;
             match ev {
                 TabletEvent::Down { x, y, pressure } => {
-                    let p = egui::pos2(x * screen.width(), y * screen.height());
+                    let p = to_ui(x, y);
                     if rect.contains(p) {
                         self.current = Some(Stroke::new());
                         self.tablet_active = true;
@@ -472,7 +483,7 @@ impl InkApp {
                     }
                 }
                 TabletEvent::Move { x, y, pressure } => {
-                    let p = egui::pos2(x * screen.width(), y * screen.height());
+                    let p = to_ui(x, y);
                     if rect.contains(p) {
                         self.push_point(p, pressure, now, rect);
                     }
@@ -2176,6 +2187,105 @@ mod tests {
             app.strokes[0].points.len() >= 10,
             "points={}",
             app.strokes[0].points.len()
+        );
+    }
+
+    /// Fenêtré : le stylet ne doit capturer que la zone physique de l'écran
+    /// couverte par la fenêtre, pas l'écran entier. On simule un moniteur
+    /// 2560x1440 et une fenêtre 800x600 posée en (1000, 200) sur l'écran.
+    #[test]
+    fn tablette_fenetre_ne_capture_que_la_zone_physique_de_la_fenetre() {
+        let ctx = egui::Context::default();
+        let (tx, rx) = channel();
+        let src = ModelSource::Repo("Sachin-0001/crnn-iam-handwriting".into());
+        let mut app = InkApp::with_tablet_rx(
+            Box::new(MockRecognizer),
+            "mock".to_string(),
+            model_choices(&src),
+            0,
+            Config::default(),
+            DecodeOptions::default(),
+            Some(rx),
+        );
+        // Fenêtre 800x600 (points UI) posée à (1000, 200) sur un moniteur 2560x1440.
+        let raw = |t: f64| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            viewports: [(
+                egui::ViewportId::ROOT,
+                egui::ViewportInfo {
+                    inner_rect: Some(egui::Rect::from_min_size(
+                        egui::pos2(1000.0, 200.0),
+                        egui::vec2(800.0, 600.0),
+                    )),
+                    monitor_size: Some(egui::vec2(2560.0, 1440.0)),
+                    ..Default::default()
+                },
+            )]
+            .into_iter()
+            .collect(),
+            time: Some(t),
+            ..Default::default()
+        };
+
+        // Hors de la fenêtre physique : x=0.1 -> 256 px écran < 1000 -> ignoré.
+        tx.send(TabletEvent::Down {
+            x: 0.1,
+            y: 0.5,
+            pressure: 1.0,
+        })
+        .unwrap();
+        let mut out = ctx.run_ui(raw(1.0), |ui| app.ui_inner(ui));
+        out.textures_delta.clear();
+        assert!(
+            app.current.is_none(),
+            "hors fenêtre : aucun stroke ne doit s'ouvrir"
+        );
+        tx.send(TabletEvent::Up).unwrap();
+        let mut out = ctx.run_ui(raw(1.1), |ui| app.ui_inner(ui));
+        out.textures_delta.clear();
+
+        // Dans la fenêtre : x=0.5 -> 1280 px écran -> UI x = 280 ;
+        // y=0.3 -> 432 px écran -> UI y = 232 (dans le canvas central).
+        tx.send(TabletEvent::Down {
+            x: 0.5,
+            y: 0.3,
+            pressure: 1.0,
+        })
+        .unwrap();
+        let mut out = ctx.run_ui(raw(1.2), |ui| app.ui_inner(ui));
+        out.textures_delta.clear();
+        assert!(
+            app.current.is_some(),
+            "dans la fenêtre : le stroke doit s'ouvrir"
+        );
+        tx.send(TabletEvent::Move {
+            x: 0.55,
+            y: 0.3,
+            pressure: 1.0,
+        })
+        .unwrap();
+        let mut out = ctx.run_ui(raw(1.3), |ui| app.ui_inner(ui));
+        out.textures_delta.clear();
+        tx.send(TabletEvent::Up).unwrap();
+        let mut out = ctx.run_ui(raw(1.4), |ui| app.ui_inner(ui));
+        out.textures_delta.clear();
+        assert_eq!(app.strokes.len(), 1);
+        let pts = &app.strokes[0].points;
+        assert!(pts.len() >= 2, "points={}", pts.len());
+        // Coordonnées relatives au canvas (rect.min = (8, 34) dans ce layout) :
+        // x attendu = 280 - 8 = 272, y attendu = 232 - 34 = 198.
+        assert!(
+            (pts[0].x - 272.0).abs() < 1.0,
+            "x canvas attendu 272, eu {}",
+            pts[0].x
+        );
+        assert!(
+            (pts[0].y - 198.0).abs() < 1.0,
+            "y canvas attendu 198, eu {}",
+            pts[0].y
         );
     }
 

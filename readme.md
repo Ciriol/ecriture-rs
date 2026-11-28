@@ -151,6 +151,25 @@ ecriture-rs/
 └── LICENSE.md
 ```
 
+## Organisation multi-machines (dev ↔ yogarch)
+
+Deux machines, deux rôles, sessions archivées ensemble dans l'arbre `vibe` :
+
+| Machine | Rôle | Sessions |
+|---|---|---|
+| poste de dev (32 Go RAM) | modèles de reconnaissance, conversions de poids, entraînements, tests de parité gourmands (`cargo test --release -- --ignored`) | branche `vibe-reconnaissance` |
+| **yogarch** (`192.168.1.34`, plateforme cible, ~8 Go RAM) | interface (fenêtre, tablette evdev, souris/hover), tests directs sur la cible via `uinput-pilot` + record/replay | branche `vibe-interface` |
+
+- Le hook `session_end` archive chaque session dans sa branche par catégorie
+  (mots-clés du titre) ; `git fetch origin` ramène les sessions de l'autre
+  machine, le rebuild les fusionne par date dans `vibe` / `vibe-interface` /
+  `vibe-reconnaissance`.
+- SSH vers yogarch sans mot de passe en clair dans l'historique : askpass
+  lisant `~/.vibe/archive-scrub-local.txt` (chmod 600, hors dépôt, masqué
+  dans l'archive vibe) — voir `archive-vibe-sessions`.
+- Pour lancer une tâche lourde sur yogarch : `ssh ciriol@192.168.1.34 'cd
+  ~/Projets/ecriture-rs && cargo test --release -- --ignored bench_iam'`.
+
 ## Tests
 
 ```bash

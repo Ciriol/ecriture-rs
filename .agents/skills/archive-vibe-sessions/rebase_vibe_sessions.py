@@ -91,10 +91,10 @@ def scrub(data):
 def classify(slug, title):
     if slug in CATEGORIES:
         return CATEGORIES[slug]
-    t = (title or "").lower()
-    if any(k in t for k in ["gui", "interface", "ui", "stylet", "tablette", "souris", "hover", "trace", "affichage", "dessin"]):
+    t = ((title or "") + " " + slug).lower()
+    if any(k in t for k in ["gui", "interface", "ui", "stylet", "tablette", "souris", "hover", "trace", "affichage", "dessin", "fenetre", "fenêtre", "window"]):
         return "interface"
-    if any(k in t for k in ["recon", "crnn", "ctc", "ocr", "lexique", "model", "poids", "weights", "pylaia", "handwriting"]):
+    if any(k in t for k in ["recon", "crnn", "ctc", "ocr", "lexique", "model", "poids", "weights", "pylaia", "handwriting", "digits", "classifieur", "classifier"]):
         return "reconnaissance"
     return "general"
 

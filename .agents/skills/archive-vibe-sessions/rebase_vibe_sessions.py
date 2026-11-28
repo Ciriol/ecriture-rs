@@ -36,6 +36,27 @@ PATTERNS = [
     re.compile(rb"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"),
 ]
 
+# Secrets littéraux supplémentaires, lus HORS dépôt (jamais commités) :
+# ~/.vibe/archive-scrub-local.txt, un secret par ligne, chmod 600.
+# Ex. : mot de passe d'une machine du LAN, partagé dans une session.
+SCRUB_LOCAL_FILE = os.path.expanduser("~/.vibe/archive-scrub-local.txt")
+
+
+def _extra_patterns():
+    pats = []
+    try:
+        with open(SCRUB_LOCAL_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                s = line.rstrip("\n")
+                if s and not s.startswith("#"):
+                    pats.append(re.compile(re.escape(s.encode())))
+    except FileNotFoundError:
+        pass
+    return pats
+
+
+PATTERNS += _extra_patterns()
+
 # classement explicite des sessions connues ; les nouvelles sont classées par mots-clés
 CATEGORIES = {
     "20261103-1127-ls": "general",

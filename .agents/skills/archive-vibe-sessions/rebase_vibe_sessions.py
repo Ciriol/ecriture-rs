@@ -144,7 +144,7 @@ def collect():
             for root, _, names in os.walk(d):
                 for n in names:
                     p = os.path.join(root, n)
-                    rel = os.path.relpath(p, exp)
+                    rel = os.path.join("sessions", os.path.relpath(p, exp))
                     s["files"][rel] = ("file", p)
     return sessions
 
